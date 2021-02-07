@@ -1,0 +1,4005 @@
+---
+title: "Structure"
+output:
+ html_notebook:
+   toc: yes
+ pdf_document:
+   toc: yes
+   latex_engine: "xelatex"
+   extra_dependencies:
+     ctexcap: UTF8
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, cache=T)
+pacman::p_load(gplots, ggplot2, data.table, stringr, dplyr, tidyr, 
+               glmnet, xtable, doParallel, scales, 
+               plm, lfe, lme4, fastglm,
+               igraph, plotly, latex2exp, RColorBrewer, colorRamps, grid, dendsort,
+               gridExtra, qlcMatrix,
+               networkD3, ggpubr, biglm, RSQLite, circlize,
+               DBI)
+
+if(.Platform$OS.type=="unix") {
+  # setwd("~/Dropbox (Penn)/Linda_Wu Zhu/Data & Codes")
+}
+
+# source("../../AllData/AIS/R/heatmap.R")
+
+if(.Platform$OS.type=="windows") {
+  # setwd("D:/Dropbox (Penn)/Linda_Wu Zhu/Data_Codes")
+  Sys.setlocale(category = "LC_CTYPE", locale = "chs")
+}
+source("../src/utilities.R", encoding = "UTF-8")
+
+# qwraps2::lazyload_cache_dir("chinese_econ_largest_cluster_cache/latex/")
+```
+
+# 2012 and AIS holding network
+
+
+```{r read network 2012}
+### 1/6/2020: use Ent_url_id_concordance.csv instead because basic info missing 700k info
+basic_info <- fread("../Data/basic_info_v2_WT.csv", 
+                    header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE)
+basic_info <- basic_info %>% rename(name = "公司名")
+# fix a minor bug
+basic_info[which.max(basic_info$reg_capital)]$reg_capital <- NA
+setorder(basic_info, new_entid, -reg_capital)
+basic_info <- unique(basic_info)
+
+network <- fread("../dynamic_networks/holding_networks_2012.csv", 
+                 header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE)
+
+# entid_name <- fread("../entid_name_concordance/Ent_url_id_concordance.csv",
+# header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE)
+# entid_name <- entid_name[!is.na(firm_code) & firm_code != ""]
+# entid_name <- unique(entid_name, by = c("firm_code", "new_entid"))
+
+missing_cap <- fread("../investor_missing_cap/missing_cap.csv", 
+                     header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE)
+```
+
+
+```{r cleaning}
+# exclude self-loop
+# they kind of the same firm
+# e.g. jd group vs jd llc vs jd jsc
+# jd_id <- entid_name[grep("北京京东世纪贸易", entid_name$name), new_entid][1]
+network <- network[new_entid_invested!=new_entid_investor]
+network[share > 100, share:=100]
+network[, share:=share/100]
+
+## delete 许昌县农业生产资料公司综合门市部 驻马店市驿城区板桥镇宋涛汽配电器维修 贵阳市南明区小华火锅店
+## they have high outdegree and high impact on graph features
+network <- network[!(new_entid_invested %in% 
+                       c("5253559", "5955991", "5309963")) & 
+                     !(new_entid_investor %in% 
+                         c("5253559", "5955991", "5309963"))]
+```
+
+
+```{r network 2012} 
+# nodes <- data6[,.(name=new_entid, type, firmname=name, reg_capital, ownership)]
+# invested
+cols <- names(network)[grep("invested", names(network))]
+nodes_invested <- network[, ..cols]
+setnames(nodes_invested, 
+         old = cols, 
+         new = c("new_entid", "firm_code", "firmname", "est_year",
+                 "cntycode", "reg_cap", "indus", "ownership"))
+# investor
+cols <- names(network)[grep("investor", names(network))]
+nodes_investor <- network[, ..cols]
+setnames(nodes_investor, old = cols, 
+         new = c("new_entid", "firm_code", "firmname", "est_year",
+                 "cntycode", "reg_cap", "indus", "ownership"))
+
+cols <- c("new_entid", "firm_code", "firmname", "est_year",
+          "cntycode", "reg_cap", "indus", "ownership")
+# merge
+nodes <- rbindlist(list(nodes_invested, nodes_investor), 
+                   use.names = T, fill = T, idcol = F)
+nodes[, new_entid := as.character(new_entid)]
+nodes <- unique(nodes, by = "new_entid")
+nodes[, id:=1:.N]
+setorder(nodes, new_entid, -reg_cap)
+# nodes <- nodes[!duplicated(new_entid),]
+# tmp_id <- nodes_investor$new_entid_investor[(!(nodes_investor$new_entid_investor %in% basic_info$new_entid))]
+# View(entid_name[new_entid %in% tmp_id])
+# nodes <- c(edges$from, edges$to)
+# nodes <- data.table(entid=unique(nodes))
+for (i in names(nodes)) nodes[(get(i) == ""), (i):=NA]
+sapply(cols, function(i) nodes[is.na(get(i)),.N])
+nrow(nodes)
+
+nodes <- merge(nodes,
+               basic_info[,.(new_entid = new_entid, 
+                             firmname_2 = name, 
+                             est_year_2 = as.integer(est_year),
+                             cntycode_2 = cnty_code,
+                             reg_cap_2 = reg_capital,
+                             indus_2 = indus,
+                             ownership_2 = ownership
+               )],
+               by = "new_entid",
+               all.x=T, all.y=F)
+for(i in cols[3:length(cols)]) {
+  # print(nodes[is.na(get(i)),.N])
+  # print(nodes[is.na(get(paste0(i, "_2"))),.N])
+  nodes[is.na(get(i)), (i) := get(paste0(i, "_2"))]
+}
+setorder(nodes, id)
+nodes <- nodes[!duplicated(new_entid),]
+for(i in cols[3:length(cols)]) {
+  nodes[, (paste0(i, "_2")) := NULL]
+}
+
+nodes <- merge(nodes,
+               missing_cap[,.(new_entid = new_entid, 
+                              firmname_2 = firm_name, 
+                              reg_cap_2 = reg_cap)],
+               by = "new_entid",
+               all.x=T, all.y=F)
+nodes[is.na(firmname), firmname := firmname_2]
+nodes[is.na(reg_cap), reg_cap := reg_cap_2]
+setorder(nodes, id)
+nodes <- nodes[!duplicated(new_entid),]
+
+nodes[indus == "-" | indus == "None" | indus == "",
+      indus := NA]
+
+nodes[, firmname_2 := NULL]
+nodes[, reg_cap_2 := NULL]
+
+
+# edges
+edges <- network[,.(from=new_entid_investor, 
+                    to=new_entid_invested, 
+                    weight=share, 
+                    cash=cash)]
+
+summary(edges$weight)
+one_investor <- edges[, .N, by = to][N==1]
+nrow(one_investor)/nrow(nodes_invested)
+one_investor <- merge(one_investor, nodes, by.x="to", by.y="new_entid")
+summary(merge(one_investor, edges, by.x="to", by.y="to")[, weight])
+
+roots <- unique(edges$from[!(edges$from %in% edges$to)])
+leaves <- unique(edges$to[!(edges$to %in% edges$from)])
+both <- unique(nodes[new_entid %in% edges$from &  
+                       new_entid %in% edges$to, new_entid])
+
+## leaves
+subs <- "分公司|分工司|分厂|分院|分部|分局|分店|分销点|分行|分站|分中心|分社|分所|分理处|分销店|分销处|分场|分市场|分馆|分厅|分处|分队|分库|营业厅|门市|分理部|经营部|服务部|销售部|经销部|营业部|购销部|批发部"
+
+leaves_firmname <- nodes[new_entid%in%leaves, firmname]
+length(grep(subs, leaves_firmname))
+# tmp_idx <- setdiff(1:length(leaves_firmname), grep(c(subs), leaves_firmname))
+# View(leaves_firmname[tmp_idx[sample(1:length(tmp_idx), 10000)]])
+# nodes[new_entid%in%leaves][grep(subs, firmname), ]
+
+length(intersect(one_investor$to, leaves))
+
+## roots
+govs <- fread("../Data/gov_in_net.csv",
+              header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE)
+roots_firmname <- nodes[new_entid%in%roots, firmname]
+length(intersect(govs$new_entid, roots))
+
+tmp <- data.table(new_entid = roots, root = 1)
+nodes <- merge(nodes, tmp, by="new_entid", all.x=T)
+nodes[is.na(root), root := 0]
+tmp <- data.table(new_entid = leaves, leaf = 1)
+nodes <- merge(nodes, tmp, by="new_entid", all.x=T)
+nodes[is.na(leaf), leaf := 0]
+
+# fill share of only one investor with 1
+na.edges <- edges[is.na(weight) | weight==0, .N, by = to]
+fill_dt <- merge(na.edges, one_investor, by.x="to", by.y="to")[, .(to, weight = 1)]
+edges[fill_dt, weight := ifelse(is.na(weight)|weight==0, i.weight, weight), on = "to"]
+# fill the rest with 1/num_investor
+na.edges <- edges[is.na(weight) | weight==0, .N, by = to]
+fill_dt <- na.edges[, weight := 1/N]
+edges[fill_dt, weight := ifelse(is.na(weight)|weight==0, i.weight, weight), on = "to"]
+
+edges[, distance:=1/weight]
+edges[, distance:=distance/mean(distance)]
+
+# build graph
+g <- graph_from_data_frame(edges, T, nodes)
+g <- exclude_cc(g, size = 1)
+## delete 许昌县农业生产资料公司综合门市部 驻马店市驿城区板桥镇宋涛汽配电器维修 贵阳市南明区小华火锅店
+## they have high outdegree and high impact on graph features
+# g <- induced.subgraph(g, V(g)[!(V(g)$name %in% c("5253559", "5955991", "5309963"))])
+# saveRDS(g, "output/g_2012_no_dangling.RDS")
+```
+
+Note `r sum(is.na(network_2012$share))` (`r percent(sum(is.na(network_2012$share))/nrow(network_2012))`) of the edges have missing share and `r sum(is.na(network_2012$cash))` (`r percent(sum(is.na(network_2012$cash))/nrow(network_2012))`) have missing cash investment.
+
+## In-out network
+```{r}
+all_info <- readRDS("../Data/basic_info_full_sample_1m_clean.RDS")
+names(all_info)
+all_info[, new_entid:=as.character(new_entid)]
+all_info[!(grep("万", reg_cap_original)),.N]
+all_info[!(grep("万", reg_cap_original)), reg_capital := reg_capital/1e4]
+status_all_type = c("迁移异地", "迁出注销", "迁出", "被吊销", "登记成立", "注销企业", "注销(简易)", "注销", "正常执业", "正常", "暂无", "无", "撤销登记", "撤销", "拟注销", "成立", "待迁入", "开业", "已迁出企业", "已注销", "已开业", "已吊销", "存续（在营、开业、在册）", "存续(经营正常)", "存续(在营、开业、在册)", "存续", "在营（开业）企业", "在营（开业）", "在营", "在业", "吊销，未注销", "吊销，已注销，注销", "吊销，已注销", "吊销未注销", "吊销后注销", "吊销企业", "吊销", "其他", "停业", "企业已注销")
+
+alive_status = c("迁移异地", "迁出注销", "迁出", "登记成立", "正常执业", "正常", "暂无", "无",  "拟注销", "成立", "待迁入", "开业", "已迁出企业", "已开业", "存续（在营、开业、在册）", "存续(经营正常)", "存续(在营、开业、在册)", "存续", "在营（开业）企业", "在营（开业）", "在营", "在业", "其他")
+
+all_info[, alive := 0]
+all_info[status %in% alive_status, alive := 1]
+all_info[,.N, alive]
+
+total_reg_cap <- sum(all_info$reg_capital, na.rm = T)
+total_num <- all_info[,.N]
+tbl <- all_info[,.("Num of firms" = .N,
+                   "Pct of firms"= percent(.N/total_num),
+                   "Mean(reg cap)" = mean(reg_capital, na.rm = T),
+                   "Pct (reg cap)" = percent(sum(reg_capital, na.rm = T)/ total_reg_cap)),
+                in_net]
+tbl[, in_net:=NULL]
+tbl <- as.matrix(tbl)
+rownames(tbl) <- c("Out-of-network", "In-network")
+# 53% if impute the in-network reg cap using 2017 all in-net firms (so that all the big ones are in)
+
+print(file= "output/tables_figures/in_out_net_sum.tex",
+      xtable(tbl, 
+             align = "r|ll||ll",
+             caption = "Summary of in-out network firms",
+             label = "tbl:in-out-sum"),
+      include.rownames = T,
+      latex.environments = "center"
+)
+
+tall = all_info[,.N,status][order(-status)]
+fwrite(tall, "output/status_basic_info_full_sample_1m_clean.csv")
+```
+
+## Population stats
+```{r}
+g <- readRDS("output/g_2012.RDS")
+nodes <- as_data_frame(g, "vertices")
+edges <- as_data_frame(g, "edges")
+setDT(nodes)
+setDT(edges)
+
+## reg cap
+nodes[is.na(reg_cap) | reg_cap == "" | reg_cap < 0, .N]
+nodes[reg_cap < 0, reg_cap := 0]
+nodes[reg_cap > 2000, .N]/nodes[!is.na(reg_cap) & reg_cap != "" ,.N]
+
+print(file= "output/tables_figures/reg_cap_sum.tex",
+      xtable(t(as.matrix(summary(nodes$reg_cap))), 
+             align = "llllllll",
+             caption = "Summary of firms' registered capital",
+             label = "tbl:reg-cap-sum"),
+      include.rownames = F,
+      latex.environments = "center"
+)
+
+
+
+nodes %>%
+  ggplot(aes(x = reg_cap, fill = log10(..count..))) +
+  geom_histogram(binwidth=0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  # geom_vline(xintercept = 2000, col = "red", size = 2) +
+  scale_fill_distiller(type="seq", palette="YlGnBu", direction=1) +
+  theme_bw() +
+  ggtitle("Log-log histogram of registered capital") + 
+  xlab("log (Registered capital)") + ylab("log( Number of firms)") +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1),
+        text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(5,"line"))
+ggsave("output/tables_figures/reg_cap_dist.pdf", device = pdf(), width = 8, height = 4)
+dev.off()
+
+## est year
+nodes[as.numeric(est_year) < 1900 |
+        as.numeric(est_year) > 2019, .N]
+ret <- nodes[as.numeric(est_year) > 1949 &
+               as.numeric(est_year) < 2013, as.numeric(est_year)]
+p <- plot_discrete_range(ret, name = "Establish year", range = c(1978, NA))
+p <- print(p + theme_bw() +
+             ylab("Number of firms") +
+             theme(axis.text.y = element_text(angle = 0, hjust = 1),
+                   axis.text.x = element_text(angle = 60, hjust = 1),
+                   text = element_text(size = 14)) )
+
+ggsave("output/tables_figures/est_year_dist.pdf", p, device = pdf(), width = 8, height = 3)
+dev.off()
+
+## indus
+nodes_agg <- nodes[, .(N = .N), by = indus]
+nodes_agg <- indus.match(nodes_agg, "indus", na.rm = F)
+nodes_agg[order(-N)]
+
+p <- plot_ly(nodes_agg, labels = ~industry, values = ~N,
+             textposition = 'auto',
+             textinfo = 'label+percent',
+             textfont = list(size = 14),
+             rotation = -20) %>%
+  add_pie(hole = 0.6, domain = list(x = c(0,0.8), y = c(0,1))) %>%
+  layout(autosize=T, margin = list(r = 150, t=50),
+         # title = 'Industry composition',
+         # titlefont=list(size=20, family="Ariel"),
+         showlegend = F,
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+p
+orca(p, file = "output/tables_figures/indus_composition.pdf",  width = 800, height = 600)
+
+
+nodes_agg <- nodes[, .(sum_reg_cap = sum(reg_cap, na.rm=T)), by = indus]
+nodes_agg <- indus.match(nodes_agg, "indus", na.rm = F)
+nodes_agg[order(-sum_reg_cap)]
+
+p <- plot_ly(nodes_agg, labels = ~industry, values = ~sum_reg_cap,
+             textposition = 'auto',
+             textinfo = 'label+percent',
+             textfont = list(size = 14),
+             rotation = -10) %>%
+  add_pie(hole = 0.6, domain = list(x = c(0,0.8), y = c(0,1))) %>%
+  layout(autosize=T, margin = list(r = 150, t=50),
+         # title = 'Industry composition',
+         # titlefont=list(size=20, family="Ariel"),
+         showlegend = F,
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+p
+orca(p, file = "output/tables_figures/indus_composition_reg_cap.pdf",  width = 800, height = 600)
+
+## ownership
+nodes_agg <- nodes[, .(N = .N), by = ownership]
+nodes_agg[order(-N)]
+
+p <- plot_ly(nodes_agg, labels = ~ownership, values = ~N,
+             textposition = 'auto',
+             textinfo = 'label+percent',
+             textfont = list(size = 23),
+             direction = "clockwise", 
+             rotation = -90) %>%
+  add_pie(hole = 0.6, domain = list(x = c(0,1), y = c(0,1))) %>%
+  layout(autosize=T, 
+         # margin = list(t=50),
+         # title = 'Ownership composition',
+         # titlefont=list(size=20, family="Ariel"),
+         showlegend = F,
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+p
+orca(p, file = "output/tables_figures/ownership_composition.pdf",  width = 800, height = 600)
+
+
+nodes_agg <- nodes[, .(sum_reg_cap = sum(reg_cap, na.rm=T)), by = ownership]
+# nodes_agg[order(-N)]
+
+p <- plot_ly(nodes_agg, labels = ~ownership, values = ~sum_reg_cap,
+             textposition = 'auto',
+             textinfo = 'label+percent',
+             textfont = list(size = 23),
+             direction = "clockwise", 
+             rotation = -90) %>%
+  add_pie(hole = 0.6, domain = list(x = c(0,1), y = c(0,1))) %>%
+  layout(autosize=T, 
+         # margin = list(t=50),
+         # title = 'Ownership composition',
+         # titlefont=list(size=20, family="Ariel"),
+         showlegend = F,
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+p
+orca(p, file = "output/tables_figures/ownership_composition_reg_cap.pdf",  width = 800, height = 600)
+
+# nodes_agg %>%
+#   ggplot(aes(x= "", fill = industry, y = N)) +
+#   geom_bar(width = 1, stat = "identity") +
+#   coord_polar("y", start=0) +
+#   theme_void() +
+#   theme(legend.position="none") +
+#   geom_text(aes(y = ypos, label = industry),  size=6) +
+
+```
+
+## Pair
+```{r}
+edges <- network[,.(from=as.character(new_entid_investor), 
+                    to=as.character(new_entid_invested), 
+                    weight=share, 
+                    cash=cash)]
+
+edges[,.N]
+edges[is.na(cash) | cash == "", .N]/edges[,.N]
+# edges[,.N,by=c("from", "to")]
+
+print(file= "output/tables_figures/inv_cash_sum.tex",
+      xtable(t(as.matrix(summary(edges$cash))), 
+             align = "llllllll",
+             caption = "Summary of investment amount",
+             label = "tbl:inv-cash-sum"),
+      include.rownames = F,
+      latex.environments = "center"
+)
+
+
+edges %>%
+  ggplot(aes(x = cash, fill = log10(..count..))) +
+  geom_histogram(binwidth=0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_fill_distiller(type="seq", palette="YlGnBu", direction=1) +
+  theme_bw() +
+  ggtitle("Log-log histogram of investment amout") + 
+  xlab("log (Investment)") + ylab("log (Number of firms)") +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1),
+        text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(5,"line"))
+ggsave("output/tables_figures/inv_cash_dist.pdf", device = pdf(), width = 8, height = 4)
+dev.off()
+
+
+network[is.na(share) | share == "", .N]/network[,.N]
+# edges[,.N,by=c("from", "to")]
+
+print(file= "output/tables_figures/inv_share_sum.tex",
+      xtable(t(as.matrix(summary(network$share))), 
+             align = "llllllll",
+             caption = "Summary of investment share",
+             label = "tbl:inv-share-sum"),
+      include.rownames = F,
+      latex.environments = "center"
+)
+
+
+network %>%
+  ggplot(aes(x = share, fill = ..count..)) +
+  geom_histogram(binwidth=0.05, closed = "left",
+                 breaks = seq(0, 1, .05)) +
+  # scale_x_log10() +
+  # scale_y_log10() +
+  scale_x_continuous(labels = scales::percent) +
+  scale_fill_distiller(type="seq", palette="YlGnBu", direction=1) +
+  theme_bw() +
+  ggtitle("Histogram of investment share") + 
+  xlab("Investment") + ylab("Number of firms") +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1),
+        text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(5,"line"))
+ggsave("output/tables_figures/inv_share_dist.pdf", device = pdf(), width = 8, height = 4)
+dev.off()
+
+# percent of peripheral firms in share == 1
+length(intersect(network[share == 1, new_entid_invested],
+                 nodes[leaf==1, name]))/network[share == 1, .N] 
+
+
+## concentration
+setorder(edges, to, weight)
+ci5 <- edges[, sum(head(weight, 5), na.rm=T), "to"]
+ci5 <- merge(ci5, nodes[,.(name, est_year, cntycode, reg_cap, indus, ownership, leaf, cc, csize)], by.x="to", by.y="name")
+ci5 <- merge(ci5, indus.match.table(), by = "indus", all.x=T)
+
+
+edges_sub <- edges[weight != 1]
+ci3 <- edges_sub[, sum(head(weight, 3), na.rm=T), "to"]
+ci3 <- merge(ci3, nodes[,.(name, est_year, cntycode, reg_cap, indus, ownership, leaf, cc, csize)], by.x="to", by.y="name")
+ci3 <- merge(ci3, indus.match.table(), by = "indus", all.x=T)
+
+ci3 <- edges[, sum(head(weight, 3), na.rm=T), "to"]
+ci3 <- merge(ci3, nodes[,.(name, est_year, cntycode, reg_cap, indus, ownership, leaf, cc, csize)], by.x="to", by.y="name")
+ci3 <- merge(ci3, indus.match.table(), by = "indus", all.x=T)
+ci3 <- merge(ci3[, countyid := substr(cntycode,1,2)], 
+             province.match.table(), by = "countyid", all.x=T)
+
+ci3 %>%
+  filter(V1 <= 1 & !is.na(industry)) %>%
+  # ggplot(aes(x = V1)) +
+  # geom_density() +
+  # ggplot(aes(x = V1, fill = ..count..)) +
+  ggplot(aes(x = V1, fill = 0.05*..density..)) +
+  geom_histogram(aes(y=0.05*..density..), binwidth=0.05, closed = "left",
+                 breaks = seq(0, 1, .05)) +
+  # scale_x_log10() +
+  # scale_y_log10() +
+  scale_x_continuous(labels = scales::percent) +
+  scale_fill_distiller(type="seq", palette="YlGnBu", direction=1) +
+  theme_bw() +
+  ggtitle("Histogram of top 3 holding percentage (excluding 100% holdings)") + 
+  xlab("Top 3 holding percentage") + ylab("Proportion of firms") +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1),
+        text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(5,"line")) + 
+  facet_wrap(~industry)
+ggsave("output/tables_figures/industry_ci3.pdf", device = pdf(), height = 8, width = 6)
+dev.off()
+
+ci3 %>%
+  filter(V1 <= 1 & !is.na(ownership)) %>%
+  # ggplot(aes(x = V1)) +
+  # geom_density() +
+  # ggplot(aes(x = V1, fill = ..count..)) +
+  ggplot(aes(x = V1, fill = 0.05*..density..)) +
+  geom_histogram(aes(y=0.05*..density..), binwidth=0.05, closed = "left",
+                 breaks = seq(0, 1, .05)) +
+  # scale_x_log10() +
+  # scale_y_log10() +
+  scale_x_continuous(labels = scales::percent) +
+  scale_fill_distiller(type="seq", palette="YlGnBu", direction=1) +
+  theme_bw() +
+  ggtitle("Histogram of top 3 holding percentage (excluding 100% holdings)") + 
+  xlab("Top 3 holding percentage") + ylab("Proportion of firms") +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1),
+        text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(5,"line")) + 
+  facet_wrap(~ownership, nrow = 2)
+ggsave("output/tables_figures/ownership_ci3.pdf", device = pdf(), height = 4, width = 8)
+dev.off()
+
+ci3 %>%
+  filter(V1 <= 1 & !is.na(province)) %>%
+  # ggplot(aes(x = V1)) +
+  # geom_density() +
+  # ggplot(aes(x = V1, fill = ..count..)) +
+  ggplot(aes(x = V1, fill = 0.05*..density..)) +
+  geom_histogram(aes(y=0.05*..density..), binwidth=0.05, closed = "left",
+                 breaks = seq(0, 1, .05)) +
+  # scale_x_log10() +
+  # scale_y_log10() +
+  scale_x_continuous(labels = scales::percent) +
+  scale_fill_distiller(type="seq", palette="YlGnBu", direction=1) +
+  theme_bw() +
+  ggtitle("Histogram of top 3 holding percentage (excluding 100% holdings)") + 
+  xlab("Top 3 holding percentage") + ylab("Proportion of firms") +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1),
+        text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(5,"line")) + 
+  facet_wrap(~province, ncol = 5)
+ggsave("output/tables_figures/province_ci3.pdf", device = pdf(), height = 8, width = 6)
+dev.off()
+```
+
+### Cross holding
+```{r}
+# loop
+network_tmp <- merge(network, network, 
+                     by.x = "new_entid_invested",
+                     by.y = "new_entid_investor")
+network_tmp[new_entid_investor == new_entid_invested.y,.N]
+View(network_tmp[new_entid_investor == new_entid_invested.y,])
+cross_hold <- network_tmp[new_entid_investor == new_entid_invested.y,]
+ch_nodes <- c(cross_hold[, new_entid_investor], cross_hold[, new_entid_invested])
+ch_nodes <- unique(ch_nodes)
+length(ch_nodes)
+
+total_cash <- sum(network$cash, na.rm=T)
+sum(cross_hold$cash.x + cross_hold$cash.y, na.rm=T)/total_cash
+
+sum(nodes[new_entid %in% ch_nodes, reg_cap], na.rm=T)/sum(nodes[, reg_cap], na.rm=T)
+```
+
+### Homophily
+```{r}
+# g <- readRDS("output/g_2012_no_dangling_cent.RDS")
+# nodes <- as_data_frame(g, "vertices")
+# setDT(nodes)
+# edges <- as_data_frame(g, "edges")
+# setDT(edges)
+
+
+rdn.idx <- sample(1:nrow(nodes), 10000)
+mean(nodes[rdn.idx[1:5000], indus] == nodes[rdn.idx[5001:10000], indus], na.rm=T)
+mean(network$indus_invested == network$indus_investor, na.rm = T)
+
+nodes[, provcode := substr(cntycode, 1, 2)]
+network[, provcode_investor := substr(cntycode_investor, 1, 2)]
+network[, provcode_invested := substr(cntycode_invested, 1, 2)]
+
+get_homophily <- function(feature, npairs = 5000) 
+{
+  rdn.idx <- sample(1:nrow(nodes), 2*npairs)
+  
+  
+  rnd_x <- nodes[rdn.idx[1:npairs], get(feature)]
+  rnd_x[rnd_x == ""] <- NA
+  rnd_y <- nodes[rdn.idx[(npairs + 1):(2*npairs)], get(feature)]
+  rnd_y[rnd_y == ""] <- NA
+  
+  pair_x <- network[, get(paste0(feature, "_investor"))]
+  pair_x[pair_x == ""] <- NA
+  pair_y <- network[, get(paste0(feature, "_invested"))]
+  pair_y[pair_y == ""] <- NA
+  
+  list("feature" = rep(feature, 2),
+       "var" = c("probability", "chisq-test"), 
+       "random" = c(
+         mean(rnd_x == rnd_y, na.rm=T),
+         chisq.test(rnd_x, rnd_y)$p.value
+       ),
+       "pair" = c(
+         mean(pair_x == pair_y, na.rm = T),
+         chisq.test(pair_x, pair_y)$p.value
+       ))
+}
+
+ret <- data.table()
+for(var in c("indus", "ownership", "cntycode", "provcode")) {
+  homo <- get_homophily(var)
+  ret <- rbind(ret, as.data.frame(homo))
+}
+ret <- dcast(ret, feature ~ var, value.var = c("random", "pair"))
+ret
+
+addtorow <- list()
+addtorow$pos <- list(0, 0)
+addtorow$command <- c(" & \\multicolumn{2}{c||}{Chi-square test} & \\multicolumn{2}{c}{Probability} \\\\\n",
+                      "Attribute & Random & Pair & Random & Pair \\\\\n")
+
+print(file= "output/tables_figures/homophily.tex",
+      xtable(ret[, c(1,2,4,3,5)],
+             align = "rr|ll||ll",
+             caption="The p-values of chi-sqaure test of attriburte dependency and probability of sharing an attribute for random pairs of firms versus investment pairs.",
+             label="tbl:homophily"),
+      add.to.row = addtorow, 
+      comment=F,
+      include.colnames = F,
+      include.rownames = F,
+      atex.environments = "center",
+      format.args = list(big.mark = ","))
+
+# reg_cap heatmap
+# network$new_entid_investor <- as.character(network$new_entid_investor)
+# network <- merge(network, 
+#                  basic_info[, .(name = new_entid, 
+#                                 reg_cap_investor = reg_capital,
+#                                 est_year_investor = substr(est_date, 6, 9))], 
+#                  by.x="new_entid_investor", by.y = "name", all.x=T)
+# 
+# setorder(network, new_entid_investor, new_entid_invested, cash)
+# network <- unique(network, by = c("new_entid_investor", "new_entid_invested", "cash"))
+```
+
+#### Reg cap
+```{r}
+network[1:1000, ] %>%
+  filter(!is.na(reg_cap_invested) & !is.na(reg_cap_investor)) %>%
+  ggplot(aes(x = log10(reg_cap_invested), 
+             y = log10(reg_cap_investor), 
+             fill = log10(cash))) +
+  geom_tile(aes(fill = cash))
+
+rdn_idx <- sample(1:nrow(network), 100000)
+# network[rdn_idx, ] %>%
+network %>%
+  filter(!is.na(reg_cap_invested) & !is.na(reg_cap_investor)) %>%
+  ggplot(aes(x = log10(reg_cap_invested), 
+             y = log10(reg_cap_investor))) +
+  # stat_density_2d(aes(fill = stat(level)), geom = "polygon") +
+  geom_bin2d(binwidth = .2) +
+  geom_abline(intercept = 0, slope = 1, col = "red", size = .5) +
+  scale_fill_viridis_c(direction = -1) +
+  theme(text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(2.5,"line")) +
+  xlab("Investee registered capital") + ylab("Investor registered capital")+ 
+  labs(fill='Number') +
+  coord_cartesian(xlim = c(0, 6), ylim = c(0, 6))
+
+ggsave("output/tables_figures/reg_cap_pair.pdf", device = pdf(), width = 4, height = 4)
+dev.off()
+
+# 
+# s <- subplot(
+#   plot_ly(network[rdn_idx,],x = ~log10(reg_cap_invested), type = 'histogram'), 
+#   plotly_empty(), 
+#   plot_ly(network[rdn_idx,],x = ~log10(reg_cap_invested), y = ~log10(reg_cap_investor), z = ~log10(cash), 
+#           type = 'histogram2dcontour', showscale = T), 
+#   plot_ly(network[rdn_idx,],y = ~log10(reg_cap_investor), type = 'histogram'),
+#   nrows = 2, heights = c(0.2, 0.8), widths = c(0.8, 0.2), 
+#   shareX = TRUE, shareY = TRUE, titleX = FALSE, titleY = FALSE
+# )
+# 
+# p <- layout(s, showlegend = FALSE)
+# 
+# p
+# 
+# rdn_idx <- sample(1:nrow(network), 1000)
+# tmp <- as_adjacency_matrix(g, attr="cash")
+# tmp_sub <- tmp[rdn_idx, rdn_idx]
+# reg_cap <- network[new_entid_invested %in% colnames(tmp_sub),
+#                    .(reg_cap_invested, reg_cap_investor)]
+# 
+# 
+# pacman::p_load(akima)
+# rdn_idx <- sample(1:nrow(network), 100000)
+# 
+# netsub <- network[rdn_idx,][!is.na(reg_cap_invested) & reg_cap_invested > 0 &
+#                               !is.na(reg_cap_investor) & reg_cap_investor > 0 &
+#                               !is.na(cash) & cash > 0,
+#                             .(log_reg_cap_invested = log10(reg_cap_invested),
+#                               log_reg_cap_investor = log10(reg_cap_investor),
+#                               sum_log_cash = sum(log10(cash), na.rm=T)),
+#                             by = c("reg_cap_invested", "reg_cap_investor")]
+# 
+netsub <- network
+netsub[, x := cut(log10(reg_cap_invested),
+                  breaks = seq(-1, 10, .2),
+                  right = F,
+                  include.lowest = T,
+                  labels = seq(-1, 10-.2, .2))]
+netsub[, y := cut(log10(reg_cap_investor),
+                  breaks = seq(-1, 10, .2),
+                  right = F,
+                  include.lowest = T,
+                  labels = seq(-1, 10-.2, .2))]
+netsub$x <- as.numeric(as.character(netsub$x))
+netsub$y <- as.numeric(as.character(netsub$y))
+netsub <- netsub[, .(N=.N,
+                     sum_cash = sum(cash, na.rm=T),
+                     mean_cash = mean(cash, na.rm=T),
+                     median_cash = median(cash, na.rm=T)),
+                 by= c("x", "y")]
+
+netsub %>%
+  ggplot(aes(x = x,
+             y = y,
+             fill = log10(N))) +
+  geom_tile() +
+  geom_abline(intercept = 0, slope = 1, col = "red", size = .5) +
+  scale_fill_viridis_c(direction = -1) +
+  theme(text = element_text(size = 14),
+        legend.position="bottom",
+        legend.key.width = unit(2.5,"line")) +
+  xlab("Investee registered capital") + ylab("Investor registered capital")+
+  labs(fill='log (Number)') +
+  coord_cartesian(xlim = c(-1, 8), ylim = c(-1, 8))
+
+ggsave("output/tables_figures/reg_cap_pair.pdf", device = pdf(), width = 4, height = 4)
+dev.off()
+
+netsub %>%
+  ggplot(aes(x = x,
+             y = y,
+             fill = log10(sum_cash))) +
+  geom_tile() +
+  geom_abline(intercept = 0, slope = 1, col = "red", size = .5) +
+  scale_fill_viridis_c(direction = -1) +
+  theme(text = element_text(size = 14),
+        legend.position="bottom",
+        legend.key.width = unit(2.5,"line")) +
+  xlab("Investee registered capital") + ylab("Investor registered capital")+
+  labs(fill='log (sum inv)') +
+  coord_cartesian(xlim = c(-1, 8), ylim = c(-1, 8))
+# coord_cartesian(xlim = c(-1, 6), ylim = c(-1, 6))
+
+ggsave("output/tables_figures/reg_cap_pair_sum_inv.pdf", device = pdf(), width = 4, height = 4)
+dev.off()
+
+netsub %>%
+  ggplot(aes(x = x,
+             y = y,
+             fill = log10(median_cash))) +
+  geom_tile() +
+  geom_abline(intercept = 0, slope = 1, col = "red", size = .5) +
+  scale_fill_viridis_c(direction = -1) +
+  theme(text = element_text(size = 14),
+        legend.position="bottom",
+        legend.key.width = unit(2.5,"line")) +
+  xlab("Investee registered capital") + ylab("Investor registered capital")+
+  labs(fill='log (median inv)') +
+  coord_cartesian(xlim = c(-1, 8), ylim = c(-1, 8))
+# coord_cartesian(xlim = c(0, 6), ylim = c(0, 6))
+
+ggsave("output/tables_figures/reg_cap_pair_med_inv.pdf", device = pdf(), width = 4, height = 4)
+dev.off()
+
+
+
+
+```
+
+#### Est year
+```{r}
+network[as.numeric(est_year_invested) > 1993 &
+          as.numeric(est_year_invested) <= 2012 & 
+          as.numeric(est_year_investor) > 1993 &
+          as.numeric(est_year_investor) <= 2012,
+        .(N=.N,
+          sum_cash = sum(cash, na.rm=T),
+          mean_cash = mean(cash, na.rm=T),
+          median_cash = median(cash, na.rm=T)),
+        by = c("est_year_invested", "est_year_investor")] %>%
+  ggplot(aes(x = factor(est_year_invested), 
+             y = factor(est_year_investor), 
+             fill = log10(N))) +
+  geom_tile() +
+  scale_fill_viridis_c(direction = -1) +
+  theme(text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(2.5,"line"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  xlab("Investee establish year") + ylab("Investor establish year") + 
+  labs(fill='log (Number)') 
+
+ggsave("output/tables_figures/est_year_pair.pdf", device = pdf(), width = 4, height = 4)
+dev.off()
+
+network[as.numeric(est_year_invested) > 1993 &
+          as.numeric(est_year_invested) <= 2012 & 
+          as.numeric(est_year_investor) > 1993 &
+          as.numeric(est_year_investor) <= 2012,
+        .(N=.N,
+          sum_cash = sum(cash, na.rm=T),
+          mean_cash = mean(cash, na.rm=T),
+          median_cash = median(cash, na.rm=T)),
+        by = c("est_year_invested", "est_year_investor")] %>%
+  ggplot(aes(x = factor(est_year_invested), 
+             y = factor(est_year_investor), 
+             fill = log10(sum_cash))) +
+  geom_tile() +
+  scale_fill_viridis_c(direction = -1) +
+  theme(text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(2.5,"line"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  xlab("Investee establish year") + ylab("Investor establish year") + 
+  labs(fill='log (sum investment)') 
+
+ggsave("output/tables_figures/est_year_pair_sum_inv.pdf", device = pdf(), width = 4, height = 4)
+dev.off()
+
+network[as.numeric(est_year_invested) > 1993 &
+          as.numeric(est_year_invested) <= 2012 & 
+          as.numeric(est_year_investor) > 1993 &
+          as.numeric(est_year_investor) <= 2012,
+        .(N=.N,
+          sum_cash = sum(cash, na.rm=T),
+          mean_cash = mean(cash, na.rm=T),
+          median_cash = median(cash, na.rm=T)),
+        by = c("est_year_invested", "est_year_investor")] %>%
+  ggplot(aes(x = factor(est_year_invested), 
+             y = factor(est_year_investor), 
+             fill = log10(median_cash))) +
+  geom_tile() +
+  scale_fill_viridis_c(direction = -1) +
+  theme(text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(2.5,"line"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  xlab("Investee establish year") + ylab("Investor establish year") + 
+  labs(fill='log (median investment)') 
+
+ggsave("output/tables_figures/est_year_pair_med_inv.pdf", device = pdf(), width = 4, height = 4)
+dev.off()
+
+```
+
+## Centrality
+```{r centrality 2012, message=FALSE, warning=FALSE}
+## 1/6/2020: recalculate based on Equity_holding_centrality_Wu.Rmd
+
+V(g)$outdeg <- degree(g, mode="out")
+V(g)$indeg <- degree(g, mode="in") 
+V(g)$eigen <- 100*eigen_centrality(g,directed = F, weights = E(g)$weight)$vector
+V(g)$eigen_c <- 100*eigen_centrality(g,directed = F, weights = E(g)$cash)$vector
+V(g)$btw <- estimate_betweenness(g,directed = TRUE, cutoff = 10, weights = E(g)$distance)
+
+nodes <- as_data_frame(g, what = c("vertices"))
+setDT(nodes)
+
+# saveRDS(g, "output/g_2012_no_dangling_cent.RDS")
+
+# edges_rev_2012 <- network_2012[,.(to=new_entid_investor, from=new_entid_invested, weight=cash, share=share)]
+# edges_rev_2012 <- edges_rev_2012[!is.na(from) & !is.na(to)]
+# 
+# g_rev_2012 <- graph_from_data_frame(edges_rev_2012, T, nodes_2012)
+# eigen_cent_rev_2012 <- eigen_centrality(g_rev_2012)$vector
+# btw_2012 <- estimate_betweenness(g_2012, cutoff=4)
+
+# g_2012 <- set_vertex_attr(g, "eigen_rev", V(g), eigen_cent_rev_2012)
+# g_2012 <- set_vertex_attr(g, "outdeg", V(g), outdeg_2012)
+# g_2012 <- set_vertex_attr(g, "indeg", V(g), indeg_2012)
+# g_2012 <- set_vertex_attr(g, "betweenness", V(g), btw_2012)
+
+# list.vertex.attributes(g_2012)
+
+```
+
+```{r merge ais 2012}
+nodes_2012 <- get.data.frame(g_2012, "vertices")
+nodes_2012 <- setDT(nodes_2012)
+
+# fill in the centrality measurement
+nodes_2012$indeg <- indeg_2012
+nodes_2012$outdeg <- outdeg_2012
+nodes_2012$between <- btw_2012
+nodes_2012$eigen <- eigen_cent_rev_2012
+
+# fwrite(nodes_2012%>%select(name, firmname, indeg, outdeg, between, eigen), "centrality/centrality_2012.csv", 
+#        row.names = F)
+
+# panel_2012 <- merge(panel_2012, nodes_2012, by.x="new_entid", by.y="name", all.x=T, all.y=F)
+```
+
+### Top firms
+1/8/2020
+Eyeball the top out-degree firms and take away those bad ones.
+```{r}
+# View(nodes[grep("中国铁路", nodes$firmname)][order(-reg_cap)])
+# nodes[firmname == "中国铁路总公司"]
+# nodes_rank_by_group
+
+View(nodes[order(-eigen)][1:100])
+View(nodes[order(-eigen_c)][1:100])
+
+# 许昌县农业生产资料公司综合门市部 is wrong
+bfs_ret <- bfs(g, V(g)[V(g)$name == "5253559"], "out", 
+               unreachable = F, dist = T)
+v_sub <- names(bfs_ret$dist[!(is.na(bfs_ret$dist))])
+g_sub <- induced.subgraph(g, V(g)[V(g)$name %in% v_sub])
+nodes_sub <- as_data_frame(g_sub, "vertices")
+
+# 驻马店市驿城区板桥镇宋涛汽配电器维修	
+bfs_ret <- bfs(g, V(g)[V(g)$name == "5955991"], "out", 
+               unreachable = F, dist = T)
+v_sub <- names(bfs_ret$dist[!(is.na(bfs_ret$dist))])
+g_sub <- induced.subgraph(g, V(g)[V(g)$name %in% v_sub])
+nodes_sub <- as_data_frame(g_sub, "vertices")
+
+# 贵阳市南明区小华火锅店
+bfs_ret <- bfs(g, V(g)[V(g)$name == "5309963"], "out", 
+               unreachable = F, dist = T)
+v_sub <- names(bfs_ret$dist[!(is.na(bfs_ret$dist))])
+g_sub <- induced.subgraph(g, V(g)[V(g)$name %in% v_sub])
+nodes_sub <- as_data_frame(g_sub, "vertices")
+```
+
+```{r}
+library(gridExtra)
+degs <- c("outdeg", "eigen_c", "btw")
+for(deg in degs) {
+  topfirms <- nodes[order(-get(deg)), .(firmname, ownership, indus, get(deg))][1:30]
+  df <- topfirms
+  setnames(df, old="V4", new=deg)
+  png(paste0("output/tables_figures/top_", deg, ".png"), height = 25*nrow(df), width = 150*ncol(df))
+  grid.table(df, theme = ttheme_minimal())
+  dev.off()
+}
+```
+
+### Power law
+```{r}
+pl_outdeg <- fit_power_law(V(g)$outdeg)
+pl_indeg <- fit_power_law(V(g)$indeg)
+
+tbl_hist <- as.data.table(table(V(g)$outdeg))
+tbl_hist %>%
+  filter(V1 != 0) %>%
+  ggplot(aes(x = as.numeric(V1), y = as.numeric(N))) +
+  geom_point() +
+  theme_bw() +
+  scale_x_log10() + scale_y_log10() +
+  xlab("k: log (Outdegree)") + ylab("log (Number of firms)") +
+  theme(text = element_text(size = 14)) +
+  annotate(geom = "text",
+           x = max(as.numeric(tbl_hist$V1)), 
+           y = max((tbl_hist$N)), 
+           hjust = "inward", 
+           label = TeX(paste0("$\\propto k^{-", round(pl_outdeg$alpha,2) ,"}$")),
+           parse = T, 
+           size = 5)
+ggsave("output/tables_figures/outdeg_dist_log.pdf",  device = pdf(), width = 4, height = 4)
+dev.off()
+
+tbl_hist <- as.data.table(table(V(g)$indeg))
+tbl_hist %>%
+  filter(V1 != 0) %>%
+  ggplot(aes(x = as.numeric(V1), y = as.numeric(N))) +
+  geom_point() +
+  theme_bw() +
+  scale_x_log10() + scale_y_log10() +
+  xlab("k: log (Indegree)") + ylab("log (Number of firms)") +
+  theme(text = element_text(size = 14)) +
+  annotate(geom = "text",
+           x = max(as.numeric(tbl_hist$V1)), 
+           y = max((tbl_hist$N)), 
+           hjust = "inward", 
+           label = TeX(paste0("$\\propto k^{-", round(pl_indeg$alpha,2) ,"}$")),
+           parse = T, 
+           size = 5)
+ggsave("output/tables_figures/indeg_dist_log.pdf",  device = pdf(), width = 4, height = 4)
+dev.off()
+
+
+pl_eigen <- power.law.fit(V(g)$eigen)
+eigen_hist <- hist(log10(V(g)$eigen), breaks = 100)
+eigen_hist_log <- data.frame(breaks = eigen_hist$breaks[-length(eigen_hist$breaks)],
+                             counts = eigen_hist$counts) 
+eigen_hist_log %>%
+  ggplot(aes(x = breaks, y = counts)) +
+  geom_point() +
+  theme_bw() +
+  scale_y_log10() +
+  xlab("k: log (Eigenvector centrality)") + ylab("log (Number of firms)") +
+  theme(text = element_text(size = 14)) +
+  annotate(geom = "text",
+           x = max(eigen_hist_log$breaks), 
+           y = max(eigen_hist_log$counts), 
+           hjust = "inward", 
+           label = TeX(paste0("$\\propto k^{-", round(pl_eigen$alpha,2) ,"}$")),
+           parse = T, 
+           size = 5)
+ggsave("output/tables_figures/eigen_dist_log.pdf",  device = pdf(), width = 4, height = 4)
+dev.off()
+
+pl_eigen_c <- power.law.fit(V(g)$eigen_c)
+eigen_c_hist <- hist(log10(V(g)$eigen_c), breaks = 100)
+eigen_c_hist_log <- data.frame(breaks = eigen_c_hist$breaks[-length(eigen_c_hist$breaks)],
+                               counts = eigen_c_hist$counts) 
+eigen_c_hist_log %>%
+  ggplot(aes(x = breaks, y = counts)) +
+  geom_point() +
+  theme_bw() +
+  scale_y_log10() +
+  xlab("k: log (eigen_cvector centrality)") + ylab("log (Number of firms)") +
+  theme(text = element_text(size = 14)) +
+  annotate(geom = "text",
+           x = max(eigen_c_hist_log$breaks), 
+           y = max(eigen_c_hist_log$counts), 
+           hjust = "inward", 
+           label = TeX(paste0("$\\propto k^{-", round(pl_eigen_c$alpha,2) ,"}$")),
+           parse = T, 
+           size = 5)
+ggsave("output/tables_figures/eigen_c_dist_log.pdf",  device = pdf(), width = 4, height = 4)
+dev.off()
+```
+
+### Correlation
+```{r}
+idx <- sample(seq_along(V(g)), 10000)
+plot(log10(V(g)$indeg[idx]), log10(V(g)$outdeg[idx]))
+cor((V(g)$indeg), (V(g)$outdeg))
+plot(log10(V(g)$eigen_c[idx]), log10(V(g)$outdeg[idx]))
+```
+
+
+### Characterics of firms with high centrality
+```{r}
+# Ahern et al. claims that firms with high centralies have higher returns 
+```
+
+## Other characteristics
+```{r}
+diameter(g, weights=NA)
+#32
+diameter(g)
+# 14.43
+dis_tbl <- distance_table(g)
+plot(1:length(dis_tbl$res), dis_tbl$res)
+
+farthest_vertices(g, directed = T, weights = NA)
+# 4886675 3996271
+# NA weights: 3018537 1706070
+V(g)[name == 3018537]$firmname
+V(g)[name == 1706070]$firmname
+far_short <- shortest_paths(g, V(g)[name == 3018537], V(g)[name == 1706070], mode = "out")
+V(g)[far_short$vpath[[1]]]$firmname
+
+# transitivity (undirected)
+transitivity(g, "global")
+trans <- transitivity(g, "local")
+# NaN is those with degree one
+hist(trans[!is.nan(trans)])
+
+nrow(network)
+strong_tie_pct <- merge(network[share > .5, .(ctrl_N = .N), by = "new_entid_investor"], 
+                        network[, .(total = .N), by = "new_entid_investor"],
+                        by = "new_entid_investor")
+strong_tie_pct[sample(1:nrow(network), 1000)] %>%
+  ggplot(aes(x = total , y = ctrl_N)) +
+  geom_point()
+plot(strong_tie_pct$total, strong_tie_pct$ctrl_N)
+
+adjSM <- as(get.adjacency(g), "dgTMatrix")
+adjDT <- data.table(V1=adjSM@i+1, V2=adjSM@j+1)
+res <- adjDT[adjDT, nomatch=0, on="V2", allow.cartesian=TRUE
+             ][V1 < i.V1, .(Neighbours=paste(V2, collapse=","), N=length(V2)),
+               by=c("V1","i.V1")][order(V1)]
+```
+
+## Characteristics of the largest connected component
+```{r characteristics of the connected components, eval=T}
+g <- readRDS("output/g_2012_no_dangling_cent.RDS")
+
+### summary stats
+cl <- clusters(g)
+# dangling firm (they exists because they will or were in-network)
+sum(cl$csize==1)
+# total number of subnets
+length(unique(cl$membership)) - sum(cl$csize==1)
+hist(log(cl$csize))
+cl$csize[order(cl$csize, decreasing = T)][1:10]
+
+### charateristics
+gp <- groups(cl)
+gp_stack <- stack(gp)
+names(gp_stack) <- c("id", "group")
+gp_stack <- setDT(gp_stack)
+gp_stack$group <- as.character(gp_stack$group)
+nodes <- as_data_frame(g, what = c("vertices"))
+setDT(nodes)
+nodes <- merge(nodes, gp_stack, by.x="name", by.y="id")
+
+# reindex the connected components by the size
+nodes_rank_by_group <- nodes[,.(group_size=.N),by=group][order(group_size,decreasing = T)]
+nodes_rank_by_group[, ranked_group:=1:.N]
+nodes <- merge(nodes, nodes_rank_by_group, by="group")
+setkeyv(nodes, c("ranked_group", "reg_cap"))
+
+## add group to investor
+edges <- as_data_frame(g, what = c("edges"))
+setDT(edges)
+# edges$from <- as.character(edges$from)
+edges <- merge(edges, nodes[,.(name, ranked_group)],
+               by.x="from", by.y="name")
+
+# top_eigen <- nodes[order(nodes$eigen, decreasing = T),eigen][1000]
+# nodes[eigen>top_eigen,.N,by=ranked_group]
+
+top_reg_cap <- nodes[order(nodes$reg_cap, decreasing = T), reg_cap][1000]
+nodes[reg_cap>top_reg_cap,.N,by=ranked_group][order(N,decreasing = T)]
+
+sum_reg_cap <- nodes[,sum(reg_cap, na.rm = T)]
+sum_reg_cap_by_group <- nodes[,sum(reg_cap, na.rm = T)/sum_reg_cap, ranked_group]
+sum_reg_cap_by_group[order(ranked_group,decreasing = F)]
+
+# head(nodes[order(nodes[,(eigen)], decreasing=T)])
+# eigen_by_group <- nodes[,sum(eigen),by=ranked_group]
+# eigen_by_group[order(eigen_by_group$V1, decreasing = T)]
+# 
+# indeg_by_group <- nodes[,sum(indeg),by=ranked_group]
+# indeg_by_group[order(indeg_by_group$V1, decreasing = T)]
+```
+
+
+
+### Distribution of subnetwork sizes
+
+```{r plot centrality 2012, eval=F}
+p <- plot_discrete_range(nodes_rank_by_group$group_size, 
+                         range = c(NA, 10))
+p <- print(p + theme_bw() +
+             ggtitle("Number of subnetwork of different sizes") + 
+             xlab("Subnetwork size") + ylab("Number of Subnetworks") +
+             theme(axis.text.y = element_text(angle = 0, hjust = 1),
+                   text = element_text(size = 14)) +
+             geom_text(aes(label=paste0(frequency, "\n",
+                                        percent(frequency/sum(frequency)))), vjust=-.1)) +
+  coord_cartesian(ylim = c(0, 6e5))
+
+ggsave("output/tables_figures/subnetwork_dist.pdf", p, device = pdf(), width = 8, height = 3)
+dev.off()
+
+cl_tbl_hist <- data.table(table(nodes_rank_by_group$group_size))
+cl_tbl_hist$V1 <- as.numeric(cl_tbl_hist$V1)
+tmp <- cl_tbl_hist[V1 >= 10, sum(N)]
+cl_tbl_hist_ret <- rbind(cl_tbl_hist[1:8], data.frame(V1="10+", N=tmp))
+cl_tbl_hist_ret[, perc := percent(N/sum(N))]
+setnames(cl_tbl_hist_ret, old = c("V1", "N", "perc"), 
+         new = c("Subnetwork size", "Number of subnetworks", "Percentage"))
+print(file= "output/tables_figures/subnetwork_dist.tex",
+      xtable(t(cl_tbl_hist_ret), 
+             align = "l|lllllllll",
+             caption = "Distribution of subnetworks of different sizes",
+             label = "tbl:subnet-dist"),
+      include.colnames=F, hline.after = c(0, 1, 2),
+      latex.environments = "center"
+)
+
+
+cl_tbl_hist %>%
+  ggplot(aes(x = V1, y = N)) +
+  geom_point() +
+  theme_bw() +
+  scale_x_log10() + scale_y_log10() +
+  xlab("log (Subnetwork size)") + ylab("log (Number of Subnetworks)") +
+  theme(text = element_text(size = 14))
+ggsave("output/tables_figures/subnetwork_dist_log.pdf",  device = pdf(), width = 8, height = 3)
+dev.off()
+
+# # size of the top 20
+# cl_tbl_hist_top <- cl_tbl_hist[, perc:=percent(V1/sum(V1))][order(-V1)][1:10]
+# setnames(cl_tbl_hist_top, old = c("V1", "N", "perc"), 
+#          new = c("Subnetwork size", "Number of subnetworks", "Percentage"))
+# print(file= "output/tables_figures/subnetwork_top",
+#       xtable(t(cl_tbl_hist_top), 
+#              align = "l|llllllllll",
+#              caption = "Distribution of largest 10 subnetworks",
+#              label = "tbl:subnet-top"),
+#       # include.colnames=F, 
+#       hline.after = c(0, 1, 2),
+#       latex.environments = "center"
+# )
+
+# png("misc/.png", width = 1000, height = 600)
+# cl_tbl_hist %>%
+#   ggplot() + geom_bar(aes(x=factor(cluster_size), 
+#                           y=num_cluster, 
+#                           fill=num_cluster), stat="identity") +
+#   ggtitle("Number of clusters of different sizes") + 
+#   theme(axis.text.x = element_text(angle = 30, hjust = 1)) + 
+#   xlab("Cluster size") + ylab("Number of clusters") + 
+#   scale_fill_distiller(type="seq", palette="YlGnBu", direction=1)
+# dev.off()
+```
+
+
+### Top 10 connected components
+
+```{r top 10 connected sum reg cap, echo=F, comment=F, results='asis'}
+tmp <- nodes[ranked_group%in%seq(1,10)][,.(N=.N, 
+                                           sum_reg_cap=sum(reg_cap, na.rm=T),
+                                           median_reg_cap=median(reg_cap, na.rm=T)),
+                                        by=ranked_group][order(ranked_group)]
+tmp_inv <- edges[ranked_group%in%seq(1,10),.(N_inv=.N, 
+                                             sum_inv=sum(cash, na.rm=T),
+                                             median_inv=median(cash, na.rm=T)),
+                 by=ranked_group]
+tmp <- merge(tmp, tmp_inv, by="ranked_group")
+
+total_reg_cap <- sum(nodes$reg_cap, na.rm = T)
+total_inv <- sum(edges$cash, na.rm = T)
+total_firms <- nrow(nodes)
+
+tmp[, reg_cap_prop:=sum_reg_cap/total_reg_cap]
+tmp[, inv_prop:=sum_inv/total_inv]
+print(file= "output/tables_figures/subnet_top_sum.tex",
+      xtable((tmp[,.("Size" = N, 
+                     "Perc (firms)" = percent(N/total_firms),
+                     "Sum (cap)" = sum_reg_cap, 
+                     "Perc (cap)" = percent(reg_cap_prop),
+                     "Med (cap)" = median_reg_cap,
+                     "Sum (inv)" = sum_inv, 
+                     "Perc (inv)" = percent(inv_prop),
+                     "Med (inv)" = median_inv
+      ),]),
+      # align = "l|llllllllll",
+      align = "l|lp{.5in}|lp{.5in}p{.5in}|lp{.5in}p{.5in}",
+      caption="Summary of largest 10 subnetworks. ``Perc'' stands for percentage, ``Med'' stands for median value, ``cap'' stands for registered capital, and ``inv'' means investment amount.",
+      label = "tbl:subnet-top-sum",
+      digits = 0), 
+      comment=F,
+      latex.environments = "center",
+      format.args = list(big.mark = ","))
+```
+
+#### Summary table of non top connected components 
+
+```{r non-top reg cap dis, results='asis'}
+tmp <- nodes[ranked_group!=1, .(N=.N, sum_reg_cap=sum(reg_cap, na.rm=T)),
+             by=ranked_group]
+tmp_inv <- edges[ranked_group!=1,.(N_inv=.N, sum_inv=sum(cash, na.rm=T)),
+                 by=ranked_group]
+tmp <- merge(tmp, tmp_inv, by="ranked_group")
+setkey(tmp, ranked_group)
+
+print(xtable(t(as.matrix(summary(tmp$sum_reg_cap))), 
+             caption = "Summary table of sum of reg cap of non-top connected component"), 
+      include.rownames=F, comment=F)
+
+sample_index <- sample(1:length(cl$csize), 10000)
+plot(tmp$ranked_group[sample_index], log(tmp$sum_reg_cap[sample_index]),
+     xlab="conn. component index", ylab="log(sum reg cap)", 
+     main="Sum reg cap of conn. components sorted by size")
+
+print(xtable(t(as.matrix(summary(tmp$sum_inv))), 
+             caption = "Summary table of sum of investment (cash) of non-top connected component"), 
+      include.rownames=F, comment=F)
+
+plot(tmp$ranked_group[sample_index], log(tmp$sum_inv[sample_index]),
+     xlab="conn. component index", ylab="log(sum investment)", 
+     main="Sum investment of conn. components sorted by size")
+```
+
+```{r}
+## 1/7/2020
+tmp <- nodes[,
+             .(N=.N, 
+               sum_reg_cap=sum(reg_cap, na.rm=T),
+               median_reg_cap=median(reg_cap, na.rm=T)),
+             by=ranked_group]
+tmp_inv <- edges[,
+                 .(N_inv=.N, 
+                   sum_inv=sum(cash, na.rm=T),
+                   median_inv=median(cash, na.rm=T)),
+                 by=ranked_group]
+tmp <- merge(tmp, tmp_inv, by="ranked_group")
+
+
+tmp[, median(median_reg_cap, na.rm=T), by = N] %>%
+  # filter(N < 500) %>%
+  ggplot(aes(x = factor(N, levels = ), y = V1)) +
+  geom_point() +
+  xlab("Subnetwork size (excluding the largest three)") +
+  ylab("Median registered capital") +
+  ggtitle("Median registered capital of subnetworks by size") +
+  theme(text = element_text(size = 14))
+
+tmp[, median(median_inv, na.rm=T), by = N] %>%
+  filter(V1 <= 900 & N < 500) %>%
+  ggplot(aes(x = N, y = V1)) +
+  geom_point()  +
+  xlab("Subnetwork size (excluding the largest three)") +
+  ylab("Median investment amount") +
+  ggtitle("Median investment amount of subnetworks by size") +
+  theme(text = element_text(size = 14))
+
+```
+
+
+### Top vs non-top
+
+Note that `freq_in_top` is the frequency of firms of type in top connected components. Ditto for `freq_in_top10`. 
+
+```{r top 10 connected by onwership, echo=F, comment=F, results='asis'}
+n_top_total <- nodes[ranked_group==1, .N]
+n_nontop_total <- nodes[ranked_group!=1,.N]
+sum_reg_cap_top_total <- nodes[ranked_group==1, 
+                               sum(reg_cap, na.rm = T)]
+sum_reg_cap_nontop_total <- nodes[ranked_group!=1, 
+                                  sum(reg_cap, na.rm = T)]
+
+## ownership
+tmp <- nodes[ranked_group!=1, 
+             .(n_nontop = .N,
+               sum_reg_cap_nontop = sum(reg_cap, na.rm=T)), 
+             by=ownership]
+tmp_n <- nodes[,.(n_all = .N, 
+                  sum_reg_cap = sum(reg_cap, na.rm=T)), 
+               ownership]
+tmp <- merge(tmp, tmp_n, by="ownership")
+tmp_top <- nodes[ranked_group==1, 
+                 .(n_top = .N, 
+                   sum_reg_cap_top = sum(reg_cap, na.rm=T)), 
+                 ownership]
+tmp <- merge(tmp, tmp_top, by="ownership")
+
+tmp_ret <- tmp[,.(ownership, 
+                  num_in_top=n_top, 
+                  # freq=percent(n_top/n_top_total), 
+                  freq_in_top=percent(n_top/n_all),
+                  percent(sum_reg_cap_top/sum_reg_cap), 
+                  num_in_top10=n_nontop, 
+                  # freq_top10=percent(n_nontop/n_nontop_total),
+                  freq_in_top10=percent(n_nontop/n_all),
+                  percent(sum_reg_cap_nontop/sum_reg_cap)
+)]
+tmp_ret <- tmp[,.(ownership, 
+                  num_in_top=n_top, 
+                  freq=percent(n_top/n_top_total),
+                  percent(sum_reg_cap_top/sum_reg_cap_top_total), 
+                  num_in_top10=n_nontop, 
+                  freq_top10=percent(n_nontop/n_nontop_total),
+                  percent(sum_reg_cap_nontop/sum_reg_cap_nontop_total)
+)]
+tmp_ret
+tmp_ret$ownership <- c("", "Collective", "Foreign",    "HMT",        "Joint",      "Private",    "SOE", "Joint Venture")
+
+addtorow <- list()
+addtorow$pos <- list(0, 0)
+addtorow$command <- c(" & \\multicolumn{3}{|c|}{Top} & \\multicolumn{3}{c}{Nontop} \\\\\n",
+                      "Ownership & Number & Perc & Perc (cap) & Number & Perc & Perc (cap) \\\\\n")
+
+print(file= "output/tables_figures/top_nontop_ownership.tex",
+      xtable(tmp_ret,
+             align = "rr|lll|lll",
+             caption="Comparison of ownership type in the top subnetwork vs non-top subnetworks",
+             label="tbl:top-nontop-ownership"),
+      add.to.row = addtorow, 
+      comment=F,
+      include.colnames = F,
+      include.rownames = F,
+      atex.environments = "center",
+      format.args = list(big.mark = ","))
+
+
+## industry
+
+tmp <- nodes[ranked_group!=1, 
+             .(n_nontop = .N,
+               sum_reg_cap_nontop = sum(reg_cap, na.rm=T)), 
+             by=indus]
+tmp_n <- nodes[,.(n_all = .N, 
+                  sum_reg_cap = sum(reg_cap, na.rm=T)), 
+               indus]
+tmp <- merge(tmp, tmp_n, by="indus")
+tmp_top <- nodes[ranked_group==1, 
+                 .(n_top = .N, 
+                   sum_reg_cap_top = sum(reg_cap, na.rm=T)), 
+                 indus]
+tmp <- merge(tmp, tmp_top, by="indus")
+tmp$freq <- tmp$N.x/tmp$N.y
+tmp$freq_top <- tmp$N/tmp$N.y
+tmp_ret <- tmp[,.(indus, 
+                  num_in_top=n_top, 
+                  # freq=percent(n_top/n_top_total), 
+                  freq_in_top=percent(n_top/n_all),
+                  percent(sum_reg_cap_top/sum_reg_cap), 
+                  num_in_top10=n_nontop, 
+                  # freq_top10=percent(n_nontop/n_nontop_total),
+                  freq_in_top10=percent(n_nontop/n_all),
+                  percent(sum_reg_cap_nontop/sum_reg_cap)
+)]
+tmp_ret <- tmp[,.(indus, 
+                  num_in_top=n_top, 
+                  freq=percent(n_top/n_top_total),
+                  percent(sum_reg_cap_top/sum_reg_cap_top_total), 
+                  num_in_top10=n_nontop, 
+                  freq_top10=percent(n_nontop/n_nontop_total),
+                  percent(sum_reg_cap_nontop/sum_reg_cap_nontop_total)
+)]
+tmp_ret
+tmp_ret$indus <- c("", "transport", "catering",    "information",        "public",      "agriculture",    "manufacture", "social work", "international org", "service", "construction", "real estate", "retail", "education", "culture entertainment", "infrastructure", "utility", "science technology", "rental", "mining", "finance")
+
+addtorow <- list()
+addtorow$pos <- list(0, 0)
+addtorow$command <- c(" & \\multicolumn{3}{|c|}{Top} & \\multicolumn{3}{c}{Nontop} \\\\\n",
+                      "indus & Number & Perc & Perc (cap) & Number & Perc & Perc (cap) \\\\\n")
+
+print(file= "output/tables_figures/top_nontop_indus.tex",
+      xtable(tmp_ret,
+             align = "rr|lll|lll",
+             caption="Comparison of indus type in the top subnetwork vs non-top subnetworks",
+             label="tbl:top-nontop-indus"),
+      add.to.row = addtorow, 
+      comment=F,
+      include.colnames = F,
+      include.rownames = F,
+      atex.environments = "center",
+      format.args = list(big.mark = ","))
+
+govs$new_entid <- as.character(govs$new_entid)
+tmp = merge(govs, nodes, by.x="new_entid", by.y="name")
+tmp[,.N, by=ranked_group][order(-N)]
+```
+
+\pagebreak
+
+
+## Geographical graph
+
+```{r}
+# g <- readRDS("output/g_2012_no_dangling_cent.RDS")
+# nodes <- as_data_frame(g, "vertices")
+# edges <- as_data_frame(g, "edges")
+# setDT(nodes)
+# setDT(edges)
+
+names(nodes)
+nodes[, provcode := substr(cntycode, 1, 2)]
+nodes_agg <- nodes[, .(sum_reg_cap = sum(reg_cap, na.rm = T), 
+                       N = .N
+),
+by = provcode]
+nodes_agg <- province.countyid.match(nodes_agg, "provcode", na.rm = F)
+nodes_agg[order(-N)]
+
+edges <- merge(edges, nodes, by.x="from", by.y="name")
+edges <- merge(edges, nodes, by.x="to", by.y="name")
+
+edges_agg <- edges[, .(N = .N,
+                       sum_inv = sum(cash, na.rm = T)),
+                   by = c("provcode.x", "provcode.y")]
+setnames(edges_agg,  c("provcode.x", "provcode.y"),
+         c("from", "to"))
+
+edges_agg <- province.countyid.clean(edges_agg, c("from", "to"), na.rm = F)
+nodes_agg <- merge(nodes_agg, 
+                   edges_agg[from!=to, .(inflow = sum(sum_inv)), by = "to"],
+                   by.x = "provcode", by.y="to")
+g_agg <- graph_from_data_frame(edges_agg[from!=to], directed = T, nodes_agg)
+write.graph(g_agg, file = "output/geo_graph_noloop.graphml", "graphml")
+```
+
+### Heatmap
+```{r}
+
+edges_agg %>%
+  filter(!(from %in% 81:83) & !(to %in% 81:83) )  %>%
+  ggplot(aes(x = to, y = from)) +
+  geom_tile(aes(fill = log10(sum_inv))) +
+  scale_fill_distiller(palette = "Spectral") +
+  scale_x_discrete(labels = province.match.table()$province) +
+  scale_y_discrete(labels = province.match.table()$province) +
+  theme(text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(5,"line"), 
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  xlab("To") + ylab("From")
+
+ggsave("output/tables_figures/geo_heatmap.pdf", device = pdf(), width = 8, height = 8.5)
+dev.off()
+
+# heatmap with clustering
+g_agg <- read_graph("output/geo_graph.graphml", "graphml")
+g_adj <- as_adjacency_matrix(g_agg, attr = "sum_inv", sparse = F)
+g_adj <- g_adj[!rownames(g_adj) %in% c("0", "81", "82"), 
+               !colnames(g_adj) %in% c("0", "81", "82")]
+rownames(g_adj) <- province.countyid.clean(data.frame(provcode = rownames(g_adj)), "provcode", na.rm = F)$province
+colnames(g_adj) <- province.countyid.clean(data.frame(provcode = colnames(g_adj)), "provcode", na.rm = F)$province 
+
+sort_hclust <- function(..., isReverse = F) {
+  as.hclust(dendsort(as.dendrogram(...), isReverse = isReverse))  
+}
+
+# investor
+mat_cluster_rows <- hclust(as.dist(1-cor((g_adj))),
+                           method = "average")
+plot(mat_cluster_rows)
+rect.hclust(mat_cluster_rows, k = 6)
+investor_cl <- cutree(mat_cluster_rows, k = 6)
+investor_cl <- data.frame(investor_cluster = investor_cl, 
+                          row.names = names(investor_cl))
+
+# invested
+mat_cluster_cols <- hclust(as.dist(1-cor(t(g_adj))),
+                           method = "average")
+plot(mat_cluster_cols)
+rect.hclust(mat_cluster_cols, k = 6)
+invested_cl <- cutree(mat_cluster_cols, k = 6)
+invested_cl <- data.frame(invested_cluster = invested_cl, row.names = names(invested_cl))
+
+mat_cluster_cols <- sort_hclust(mat_cluster_cols, isReverse = T)
+# mat_cluster_rows <- sort_hclust(mat_cluster_rows, isReverse = T)
+
+cols <- list(
+  investor_cluster = brewer.pal(6, "Reds"),
+  invested_cluster = brewer.pal(6, "Blues")
+)
+
+pdf("output/tables_figures/geo_heatmap_clustered.pdf", width = 9, height = 8)
+setHook("grid.newpage", function() pushViewport(viewport(x=0,y=1,width=0.95, height=0.95, name="vp", just=c("left","top"))), action="prepend")
+pheatmap(log10(g_adj),
+         cluster_cols      = mat_cluster_cols,
+         cluster_rows      = mat_cluster_cols,
+         annotation_row = investor_cl,
+         annotation_col = invested_cl,
+         annotation_colors = cols, 
+         annotation_legend = F,
+         treeheight_row = 0,
+         legend = T,
+         # col = rev(brewer.pal(11,"Spectral")),
+         col = colorRampPalette(rev(brewer.pal(11,"Spectral")))(50),
+         # angle_col = "315", 
+         fontsize = 13)
+# fontsize = 14, 
+# filename = "output/tables_figures/industry_heatmap_clustered.pdf", width = 9, height = 8)
+setHook("grid.newpage", NULL, "replace")
+grid.text("Investee", y=0.0, gp=gpar(fontsize=16))
+grid.text("Investor", x=.95, rot=-90, gp=gpar(fontsize=16))
+dev.off()
+
+```
+
+### Circular plot
+
+```{r}
+g_agg <- read_graph("output/geo.graphml", "graphml")
+g_agg <- read_graph("output/geo_graph_noloop.graphml", "graphml")
+mat_agg <- as_adjacency_matrix(g_agg, attr = "sum_inv",  sparse = F)
+mat_agg <- mat_agg[2:nrow(mat_agg), 2:ncol(mat_agg)]
+
+colnames(mat_agg) <- province.countyid.match(data.frame(countyid = colnames(mat_agg)), by="countyid")[,`province`]
+rownames(mat_agg) <- province.countyid.match(data.frame(countyid = rownames(mat_agg)), by="countyid")[,`province`]
+
+grid.col <- setNames(rainbow(length(unique(unlist(dimnames(mat_agg))))), union(rownames(mat_agg), colnames(mat_agg)))
+
+png("output/tables_figures/geo_circular.png", width = 1200, height = 1200)
+chordDiagram(mat_agg, annotationTrack = "grid", preAllocateTracks = 1, grid.col = grid.col, self.link = 2,
+             directional = 1, direction.type = c("diffHeight", "arrows"),
+             link.arr.type = "big.arrow", diffHeight = -uh(2, "mm"))
+circos.trackPlotRegion(track.index = 1, panel.fun = function(x, y) {
+  xlim = get.cell.meta.data("xlim")
+  ylim = get.cell.meta.data("ylim")
+  sector.name = get.cell.meta.data("sector.index")
+  circos.text(mean(xlim), ylim[1] + .1, sector.name, facing = "clockwise", niceFacing = TRUE, adj = c(0, 0.5), cex = 2)
+  circos.axis(h = "top", labels.cex = 1, major.tick.percentage = 0.2, sector.index = sector.name, track.index = 2)
+}, bg.border = NA)
+dev.off()
+```
+
+## Industry graph
+```{r}
+g <- readRDS("output/g_2012_no_dangling_cent.RDS")
+nodes <- as_data_frame(g, "vertices")
+edges <- as_data_frame(g, "edges")
+setDT(nodes)
+setDT(edges)
+
+names(nodes)
+nodes_agg <- nodes[, .(sum_reg_cap = sum(reg_cap, na.rm = T), 
+                       N = .N
+),
+by = indus]
+nodes_agg <- indus.match(nodes_agg, "indus", na.rm = F)
+nodes_agg[order(-sum_reg_cap)]
+
+
+edges <- merge(edges, nodes, by.x="from", by.y="name")
+edges <- merge(edges, nodes, by.x="to", by.y="name")
+
+edges_agg <- edges[, .(N = .N,
+                       sum_inv = sum(cash, na.rm = T)),
+                   by = c("indus.x", "indus.y")]
+setnames(edges_agg,  c("indus.x", "indus.y"),
+         c("from", "to"))
+
+edges_agg <- indus.clean(edges_agg, c("from", "to"), na.rm = F)
+nodes_agg <- merge(nodes_agg, 
+                   edges_agg[from!=to, .(inflow = sum(sum_inv)), by = "to"],
+                   by.x = "indus", by.y="to")
+g_agg <- graph_from_data_frame(edges_agg, directed = T, nodes_agg)
+write.graph(g_agg, file = "output/industry_no_loop.graphml", "graphml")
+```
+
+
+### Heatmap
+```{r}
+edges_agg <- indus.match(edges_agg, c("from", "to"))
+edges_agg %>%
+  ggplot(aes(x = industry.y, y = industry.x)) +
+  geom_tile(aes(fill = log10(sum_inv))) +
+  scale_fill_distiller(palette = "Spectral") +
+  theme(text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(4,"line"), 
+        axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1)) +
+  xlab("Investee") + ylab("Investor") +
+  labs(fill='log10(Investment sum)') 
+
+
+ggsave("output/tables_figures/industry_heatmap.pdf", device = pdf(), width = 9, height = 8)
+dev.off()
+
+# heatmap with clustering
+g_agg <- read_graph("output/industry.graphml", "graphml")
+g_adj <- as_adjacency_matrix(g_agg, attr = "sum_inv", sparse = F)
+g_adj <- g_adj[-1, -1]
+rownames(g_adj) <- indus.clean(data.frame(indus = rownames(g_adj)), "indus", na.rm = F)$industry 
+colnames(g_adj) <- indus.clean(data.frame(indus = colnames(g_adj)), "indus", na.rm = F)$industry 
+
+
+# investor
+mat_cluster_rows <- hclust(as.dist(1-cor((g_adj))),
+                           method = "average")
+plot(mat_cluster_rows)
+rect.hclust(mat_cluster_rows, k = 6)
+investor_cl <- cutree(mat_cluster_rows, k = 6)
+investor_cl <- data.frame(investor_cluster = investor_cl, 
+                          row.names = names(investor_cl))
+
+# invested
+mat_cluster_cols <- hclust(as.dist(1-cor(t(g_adj))),
+                           method = "average")
+plot(mat_cluster_cols)
+rect.hclust(mat_cluster_cols, k = 6)
+invested_cl <- cutree(mat_cluster_cols, k = 6)
+invested_cl <- data.frame(invested_cluster = invested_cl, row.names = names(invested_cl))
+
+mat_cluster_cols <- sort_hclust(mat_cluster_cols, isReverse = T)
+# mat_cluster_rows <- sort_hclust(mat_cluster_rows, isReverse = T)
+
+cols <- list(
+  investor_cluster = brewer.pal(6, "Reds"),
+  invested_cluster = brewer.pal(6, "Blues")
+)
+
+pdf("output/tables_figures/industry_heatmap_clustered.pdf", width = 9, height = 7.5)
+setHook("grid.newpage", function() pushViewport(viewport(x=0,y=1,width=0.95, height=0.95, name="vp", just=c("left","top"))), action="prepend")
+pheatmap(log10(g_adj),
+         cluster_cols      = mat_cluster_cols,
+         cluster_rows      = mat_cluster_cols,
+         annotation_row = investor_cl,
+         annotation_col = invested_cl,
+         annotation_colors = cols, 
+         annotation_legend = F,
+         treeheight_row = 0,
+         legend = T,
+         # col = rev(brewer.pal(11,"Spectral")),
+         col = colorRampPalette(rev(brewer.pal(11,"Spectral")))(50),
+         # angle_col = "315", 
+         fontsize = 13)
+# fontsize = 14, 
+# filename = "output/tables_figures/industry_heatmap_clustered.pdf", width = 9, height = 8)
+setHook("grid.newpage", NULL, "replace")
+grid.text("Investee", y=0.0, gp=gpar(fontsize=16))
+grid.text("Investor", x=.95, rot=-90, gp=gpar(fontsize=16))
+dev.off()
+
+# heatmap.2(log10(g_adj))
+# hr <- hclust(as.dist(cor(t(log10(g_adj)), method="pearson")), method="complete")
+# ## Column clustering (adjust here distance/linkage methods to what you need!)
+# hc <- hclust(as.dist(cor(log10(g_adj), method="spearman")), method="complete")
+#  
+# ## Plot heatmap
+# heatmap.2(log10(g_adj), Rowv=as.dendrogram(hr), Colv=as.dendrogram(hc), density.info="none", trace="none", col=rev(brewer.pal(11,"Spectral")),srtCol=45, srtRow=0, cexRow = 1,keysize=0.75,key.par = list(cex=0.5),
+# margins=c(15,15))
+```
+
+```{r}
+# industry flow
+names(network)
+edges_agg <- network[, .(N = .N,
+                         sum_inv = sum(cash, na.rm = T)),
+                     by = c("indus_investor", "indus_invested")]
+setnames(edges_agg,  c("indus_investor", "indus_invested"),
+         c("from", "to"))
+edges_agg <- indus.match(edges_agg, c("from", "to"), na.rm = T)
+
+edges_agg_ret <- edges_agg[, sum(sum_inv, na.rm = T), by="industry.x"][order(-V1)]
+edges_agg <- edges_agg[from != to]
+edges_agg_ret <- merge(edges_agg_ret,
+                       edges_agg[, sum(sum_inv, na.rm = T),
+                                 by="industry.x"][order(-V1)],
+                       by="industry.x")
+edges_agg_ret <- merge(edges_agg_ret,
+                       nodes_agg[!is.na(industry), sum(N), by="industry"],
+                       by.x = "industry.x", by.y="industry")
+
+edges_agg_ret_tbl <- edges_agg_ret[, .(indus = industry.x, 
+                                       across = V1.y/V1,
+                                       total = V1.x/V1,
+                                       N = V1)][order(-across)]
+names(edges_agg_ret_tbl) <- c("Industry", 
+                              "Mean cross industry inv",
+                              "Mean inv",
+                              "Firm number")
+print(file= "output/tables_figures/industry.tex",
+      xtable(edges_agg_ret_tbl, 
+             align = "rr|p{1in}p{1in}p{1in}",
+             caption = "Equity flow by industry",
+             label = "tbl:industry-flow"),
+      latex.environments = "center",
+      include.rownames = F,
+      format.args = list(big.mark = ",")
+)
+
+
+edges_agg_ret <- edges_agg[, sum(sum_inv, na.rm = T), by="industry.y"][order(-V1)]
+edges_agg <- edges_agg[from != to]
+edges_agg_ret <- merge(edges_agg_ret,
+                       edges_agg[, sum(sum_inv, na.rm = T),
+                                 by="industry.y"][order(-V1)],
+                       by="industry.y")
+edges_agg_ret <- merge(edges_agg_ret,
+                       nodes_agg[!is.na(industry), sum(N), by="industry"],
+                       by.x = "industry.y", by.y="industry")
+
+edges_agg_ret_tbl <- edges_agg_ret[, .(indus = industry.y, 
+                                       across = V1.y/V1,
+                                       total = V1.x/V1,
+                                       N = V1)][order(-across)]
+names(edges_agg_ret_tbl) <- c("Industry", 
+                              "Mean cross industry inv",
+                              "Mean inv",
+                              "Firm number")
+print(file= "output/tables_figures/industry_invested.tex",
+      xtable(edges_agg_ret_tbl, 
+             align = "rr|p{1in}p{1in}p{1in}",
+             caption = "Equity inflow by industry",
+             label = "tbl:industry-flow-invested"),
+      latex.environments = "center",
+      include.rownames = F,
+      format.args = list(big.mark = ",")
+)
+```
+
+
+### Circular plot
+
+```{r}
+# g_agg <- read.graph("output/industry_no_loop.graphml", "graphml")
+mat_agg <- as_adjacency_matrix(g_agg, attr = "sum_inv",  sparse = F)
+mat_agg <- mat_agg[2:nrow(mat_agg), 2:ncol(mat_agg)]
+diag(mat_agg) <- 0
+
+colnames(mat_agg) <- indus.match(data.frame(indus = colnames(mat_agg)), by="indus")[,`industry`]
+rownames(mat_agg) <- indus.match(data.frame(indus = rownames(mat_agg)), by="indus")[,`industry`]
+
+grid.col <- setNames(rainbow(length(unique(unlist(dimnames(mat_agg))))), union(rownames(mat_agg), colnames(mat_agg)))
+
+png("output/tables_figures/ind_circular.png", width = 1200, height = 1200)
+chordDiagram(mat_agg, annotationTrack = "grid", preAllocateTracks = 1, grid.col = grid.col, self.link =  1,
+             directional = 1, direction.type = c("diffHeight", "arrows"),
+             link.arr.type = "big.arrow", diffHeight = -uh(2, "mm"))
+circos.trackPlotRegion(track.index = 1,
+                       panel.fun = function(x, y) {
+                         xlim = get.cell.meta.data("xlim")
+                         ylim = get.cell.meta.data("ylim")
+                         sector.name = get.cell.meta.data("sector.index")
+                         circos.text(mean(xlim), ylim[1] + .1, sector.name, facing = "clockwise", 
+                                     niceFacing = TRUE, adj = c(0, 0.5), cex = 1.5)
+                         circos.axis(h = "top", labels.cex = 1, major.tick.percentage = 0.2, 
+                                     sector.index = sector.name, track.index = 2)
+                       }, 
+                       bg.border = NA)
+dev.off()
+```
+
+
+## Largest cluster
+
+```{r largest cluster summary}
+g <- readRDS("output/g_2012_no_dangling_cent.RDS")
+cl <- clusters(g)
+
+# get the largest cluster
+# v_lar <- V(g)[which(cl$membership==which(cl$csize==max(cl$csize)))]
+# v_lar <- v_lar[!(v_lar$name=="NA")]
+# g_lar <- induced.subgraph(g, v_lar)
+# 
+# E(g_lar)$weight[E(g_lar)$weight==0] <- 1
+# E(g_lar)$weight[is.na(E(g_lar)$weight)] <- 1
+# 
+# write.graph(g_lar, "misc/g_lar.net", "pajek")
+# 
+# sum(E(g_lar)$weight, na.rm = T)
+# sum(is.na(E(g_lar)$weight))
+# sum((E(g_lar)$weight == 0))
+
+g_lar <- extract_cc(g, which = 1)
+
+V(g_lar)$indeg <- degree(g_lar, mode="in")
+V(g_lar)$outdeg <- degree(g_lar, mode="out")
+
+V(g_lar)$btw <- estimate_betweenness(g_lar, 
+                                     directed = T, 
+                                     cutoff = 10, 
+                                     weight = E(g_lar)$weight)
+# g_lar_nodes$closeness <- closeness(g_lar, mode = "out")
+V(g_lar)$eigen <- eigen_centrality(g_lar, 
+                                   directed = T, 
+                                   weight = E(g_lar)$weight, 
+                                   scale = T)$vector
+
+V(g_lar)$eigen_c <- eigen_centrality(g_lar, 
+                                     directed = F, 
+                                     weight = E(g_lar)$cash, 
+                                     scale = T)$vector
+
+saveRDS(g_lar, "output/g_lar_2012.RDS")
+
+# V(g_lar)$hub <- hub.score(g_lar, 
+#                           weight = E(g_lar)$weight, 
+#                           scale = T)
+# V(g_lar)$aut <- authority.score(g_lar, 
+#                                 weight = E(g_lar)$weight, 
+#                                 scale = T)
+
+g_lar_nodes <- get.data.frame(g_lar, "vertices")
+g_lar_nodes <- setDT(g_lar_nodes)
+
+edges_rev <- get.data.frame(g_lar, "edges")
+edges_rev <- setDT(edges_rev)
+setnames(edges_rev, old=c("from", "to"), new=c("old", "from"))
+g_rev <- graph_from_data_frame(edges_rev, T, g_lar_nodes)
+eigen_cent_rev <- eigen_centrality(g_rev)$vector
+g_lar_nodes$eigen_rev <- eigen_cent_rev
+
+# The largest connected component accounts for `r percent(basic_info[new_entid%in%g_lar_2012_nodes, sum(reg_capital, na.rm = T)]/basic_info[,sum(reg_capital, na.rm = T)])` of the total registered capital.
+```
+
+## Second Largest cluster
+
+```{r largest cluster summary}
+# saveRDS(g_lar, "misc/g_lar_2nd_2012.RDS")
+# g_2012 <- readRDS("misc/g_2012.RDS")
+# g_lar <- readRDS("misc/g_lar_2nd_2012.RDS")
+cl <- clusters(g_2012)
+
+# get the largest cluster
+# csize2 <- cl$csize[order(cl$csize, decreasing = T)][2]
+# v_lar <- V(g_2012)[which(cl$membership==which(cl$csize==csize2))]
+# v_lar <- v_lar[!(v_lar$name=="NA")]
+# g_lar <- induced.subgraph(g_2012, v_lar)
+g_lar <- extract_cc(g_2012, 2:3)
+
+graph.density(g_lar)
+reciprocity(g_lar)
+triad_census(g_lar)
+
+diameter(g_lar)
+
+diam <- get_diameter(g_lar)
+nindus <- length(unique(V(g_lar)$indus))
+vcol <- c(rainbow(nindus))[as.numeric(factor(V(g_lar)$indus))]
+vlab <- V(g_lar)$firmname
+vlab[V(g_lar)$reg_capital < 1000] <- NA
+ecol <- rep("gray80", ecount(g_lar))
+ecol[E(g_lar, path=diam)] <- "orange"
+
+V(g_lar)$size <- log(V(g_lar)$reg_capital + 1.1)
+V(g_lar)$size[is.na(V(g_lar)$size)] <- 0
+E(g_lar)$width <- E(g_lar)$weight/100
+
+plot(g_lar, vertex.color=vcol, edge.color=ecol, edge.arrow.mode=0,
+     vertex.label = vlab, layout = layout.auto)
+
+# tkid <- tkplot(g_lar)
+
+
+hs <- hub_score(g_lar)$vector
+plot(g_lar, vertex.color=vcol, edge.color=ecol, edge.arrow.mode=0,
+     vertex.label = NA, layout = layout.auto, vertex.size = hs*10)
+
+
+cfg <- cluster_fast_greedy(as.undirected(g_lar))
+plot(cfg, g_lar)
+V(g_lar)$community <- cfg$membership
+# co <- cluster_optimal(g_lar)
+
+
+V(g_lar)$indus[is.na(V(g_lar)$indus) | 
+                 V(g_lar)$indus == "" |
+                 V(g_lar)$indus == "NA"] <- NA
+V(g_lar)$ownership[is.na(V(g_lar)$ownership) | 
+                     V(g_lar)$ownership == "" |
+                     V(g_lar)$ownership == "NA"] <- NA
+V(g_lar)$reg_capital[is.na(V(g_lar)$reg_capital) | 
+                       V(g_lar)$reg_capital == "" |
+                       V(g_lar)$reg_capital == "NA"] <- 0
+# assortativity_nominal(g_lar, V(g_lar)$ownership)
+
+
+
+
+
+E(g_lar)$weight[E(g_lar)$weight==0] <- 1
+E(g_lar)$weight[is.na(E(g_lar)$weight)] <- 1
+
+write.graph(g_lar, "misc/g_lar_2012.net", "pajek")
+
+sum(E(g_lar)$weight, na.rm = T)
+sum(is.na(E(g_lar)$weight))
+sum((E(g_lar)$weight == 0))
+
+g_lar_2012_nodes <- get.data.frame(g_lar, "vertices")
+g_lar_2012_nodes <- setDT(g_lar_2012_nodes)
+
+g_lar_2012_nodes$indeg <- degree(g_lar, mode="in")
+g_lar_2012_nodes$outdeg <- degree(g_lar, mode="out")
+
+g_lar_2012_nodes$between <- estimate_betweenness(g_lar, directed = T, cutoff = 5)
+# g_lar_2012_nodes$closeness <- closeness(g_lar, mode = "out")
+g_lar_2012_nodes$eigen <- eigen_centrality(g_lar, directed = T)$vector
+
+edges_rev <- get.data.frame(g_lar, "edges")
+edges_rev <- setDT(edges_rev)
+setnames(edges_rev, old=c("from", "to"), new=c("old", "from"))
+g_rev <- graph_from_data_frame(edges_rev, T, g_lar_2012_nodes)
+eigen_cent_rev <- eigen_centrality(g_rev)$vector
+g_lar_2012_nodes$eigen_rev <- eigen_cent_rev
+
+# The largest connected component accounts for `r percent(basic_info[new_entid%in%g_lar_2012_nodes, sum(reg_capital, na.rm = T)]/basic_info[,sum(reg_capital, na.rm = T)])` of the total registered capital.
+```
+
+
+### model
+```{r}
+# as_long_data_frame(g_lar)
+g_lar <- extract_cc(g_2012, 2:5)
+ids <- V(g_lar)$name
+degrees <- data.table(id = ids,
+                      indeg = degree(g_lar, mode = "in"),
+                      outdeg = degree(g_lar, mode = "out")
+)
+edge.df <- as.data.table(get.edgelist(g_lar))
+edge.df$y <- 1
+
+df <- as.data.table(t(combn(ids, 2)))
+df <- merge(df, edge.df, by = c("V1", "V2"), all.x = T)
+
+# subset edges
+edge.df.sub.idx <- sample(1:nrow(edge.df), 5000)
+edge.df.sub <- edge.df[edge.df.sub.idx, ]
+ids.sub <- ids[ids %in% unique(c(edge.df.sub$V1, edge.df.sub$V2))]
+
+df <- as.data.table(t(combn(ids.sub, 2)))
+df <- merge(df, edge.df.sub, by = c("V1", "V2"), all.x = T)
+
+### 
+df[is.na(y), y:=0]
+setnames(df, old = c("V1", "V2"), new = c("from", "to"))
+df <- merge(df, degrees[, .(id, indeg)], 
+            by.x = "to", by.y = "id")
+df <- merge(df, degrees[, .(id, outdeg)], 
+            by.x = "from", by.y = "id")
+tmp_cols <- c("indeg", "outdeg")
+df[, (tmp_cols) := lapply(.SD, as.factor), .SDcols = tmp_cols]
+
+{
+  # df_in <- merge(df, degrees[, .(id, indeg)], 
+  #             by.x = "to", by.y = "id")
+  # df_in <- dcast(df_in, to + from + y ~ indeg, 
+  #             value.var = "indeg", fill = 0)
+  # old_names <- names(df_in)[grep(pattern = "^[0-9]", names(df_in))]
+  # setnames(df_in, old = old_names, new = paste0("i_", old_names))
+  # 
+  # df_out <- merge(df, degrees[, .(id, outdeg)], 
+  #             by.x = "from", by.y = "id")
+  # df_out <- dcast(df_out, to + from + y ~ outdeg, 
+  #       value.var = c("outdeg"), fill = 0)
+  # old_names <- names(df_out)[grep(pattern = "^[0-9]", names(df_out))]
+  # setnames(df_out, old = old_names, new = paste0("o_", old_names))
+  # 
+  # df <- merge(df_in, df_out, by=c("to", "from", "y"))
+}
+
+fit <- glm(y ~ . - to - from + 0, family = "binomial", df)
+
+fit <- bigglm(E ~ INDEG + OUTDEG - 1, 
+              family = binomial(link = "logit"), 
+              chunksize=10, data = df)
+
+summary(fit)
+
+num_unique <- length(unique(c(df$indeg, df$outdeg)))
+sample_idx <- sample(1:nrow(df), 1000*num_unique)
+x <- model.matrix(y ~ . -to-from, df[sample_idx,])
+
+x <- model.matrix(y ~ indeg + outdeg - 1, df)
+fit <- fastglm(x, df$y, family = "binomial")
+summary(fit)
+
+
+```
+
+## Computation
+
+Computation of generalized linear regression of 5m*5m observations is 
+both computationally and memory intensive. 
+Several approaches are considered here. 
+Exact solution can be obtained by first storing
+all the oberservations in the database and then solving using `bigglm`.
+A naive approxiamte solution is by splitting the data
+into subsets and then taking the average of the estimate of each subset.
+The naive approxiamte solution is suboptimal and there
+exists literature on distributed linear regression and generalized linear regression. 
+
+We first attempt to solve the problem using `bigglm()` to get
+an exact solution as a benchmark and then compare different approxiamte solutions.
+Bayesian solution (with random effect) will be also considered (from James).
+
+
+### Exact solution
+
+Consider the generalize linear model setup.
+Let $y \in \mathbb{R}^n$ be a vector of response and
+$X \in \mathbb{R}^{n\times p}$ be the design matrix.
+Then
+\[
+E(y_i \mid x_i) = g(x_i^T \beta)
+\]
+where $\beta\in\mathbb{R}^p$ is parameters of interest 
+and $g$ is the link function.
+
+For logistics regression, $g$ is the logit function
+and let $h$ be the inverse link function, i.e. 
+$h(x) = (1+e^{x})^{-1}$. The log-likelihood is then
+\[
+\begin{split}
+\ell(\beta;y) 
+&= \sum_{i=1}^n y_i \log h(x_i^T\beta) + (1-y_i)\log(1-h(x_i^T\beta)) \\
+&= \sum_{i=1}^n - y_i \cdot x_i^T\beta - \log(1+e^{-x_i^T\beta}).
+\end{split}
+\]
+
+Take derivatives yields
+\[
+\begin{split}
+\frac{\partial \ell}{\partial \beta_j} 
+&= \sum_i x_{ij}(y_i - h(x_i^T\beta)) \\
+\frac{\partial^2 \ell}{\partial \beta_j \partial\beta_k} 
+&= \sum_i x_{ij} x_{ik} [h(x_i^T\beta)(1 - h(x_i^T\beta)) ]
+\end{split}
+\]
+
+The score function and Hessian is then
+\[
+\begin{split}
+\nabla\ell(\beta; y) 
+&= X^T(y - h(X^T\beta)) = X^T(y - \hat{y}) \\
+H
+&= -X^T W X
+\end{split}
+\]
+where $W = \text{diag}(h(x_1^T\beta)(1 - h(x_1^T\beta)), \ldots, h(x_n^T\beta)(1 - h(x_n^T\beta))) = \text{diag}(\hat{y_1}(1-\hat{y_1}), \ldots, \hat{y_n}(1-\hat{y_n}))$.
+
+Let $z = W^{-1}(y - \hat{y})$. By Newton-Raphson,
+\[
+\begin{split}
+\beta^{(t+1)} 
+& = \beta^{(t)} - H^{-1} \nabla\ell \\
+& = \beta^{(t)} + (X^T W^{(t)}X)^{-1} X^T W^{(t)} z^{(t)}
+\end{split}
+\]
+
+Note that $(X^T W^{(t)}X)^{-1} X^T W^{(t)} z^{(t)}$ is
+the solution of weighted least squares of $z^{(t)}$ on $X$.
+Hence the algorithm is called iterative reweighted  least squares (IRLS).
+
+Computation of each iteration of $X^T W^{(t)}X$ can be split up.
+For example, let
+\[
+X = \left[\begin{array}{c}d \\ d\\ \end{array}\right],
+\quad
+W = \left[\begin{array}{cc} W_1 & 0  \\ 0 & W_2\\ \end{array}\right].
+\]
+Then 
+\[
+X^T W^{(t)}X = X_1^T W_1^{(t)}X_1 + X_2^T W_2^{(t)}X_2.
+\]
+
+
+<!-- Then -->
+<!-- \[ -->
+<!-- y = X\beta + \varepsilon -->
+<!-- \] -->
+<!-- where $\beta\in\mathbb{R}^p$ and $\varepsilon\sim N(0, \sigma^2 W^{-1})$. -->
+
+<!-- Then then solution of GLM is $\hat\beta = \arg\min_{b} (Xb - y)^T W (Xb-y) = (X^TWX)^{-1}X^T Wy$. -->
+
+The `glm()` function in R uses the iteratively reweighted least squares (IRLS) estimation or Fisher scoring. This is equivalent to Newton-Raphson
+with expected Hessian instead. 
+The `bigglm()` function in `biglm` package uses
+the incrementally update to handle data that cannot be fitted in RAM.
+More here. \url{https://bwlewis.github.io/GLM/}.
+
+```{r}
+library(RSQLite)
+library(biglm)
+db = dbConnect(SQLite(), dbname="misc/edges_2012_largest.sqlite")
+dbSendQuery(conn=db,
+            "CREATE TABLE EDGES
+   (ID VARCHAR,
+   E BOOL,
+   INVESTOR VARCHAR,
+   INVESTEE VARCHAR,
+   INDEG INT,
+   OUTDEG INT,
+   PRIMARY KEY (ID))
+")
+
+ids <- V(g_lar)$name
+degrees <- data.table(id = ids,
+                      indeg = degree(g_lar, mode = "in"),
+                      outdeg = degree(g_lar, mode = "out")
+)
+edge.df <- as.data.table(get.edgelist(g_lar))
+edge.df$y <- 1
+
+# subset edges
+edge.df.sub.idx <- sample(1:nrow(edge.df), 5000)
+edge.df.sub <- edge.df[edge.df.sub.idx, ]
+ids.sub <- ids[ids %in% unique(c(edge.df.sub$V1, edge.df.sub$V2))]
+
+# df <- as.data.table(t(combn(ids, 2)))
+# df <- merge(df, edge.df, by = c("V1", "V2"), all.x = T)
+
+df <- as.data.table(t(combn(ids.sub, 2)))
+df <- merge(df, edge.df.sub, by = c("V1", "V2"), all.x = T)
+
+df[is.na(y), y:=0]
+setnames(df, old = c("V1", "V2"), new = c("from", "to"))
+df <- merge(df, degrees[, .(id, indeg)], 
+            by.x = "to", by.y = "id")
+df <- merge(df, degrees[, .(id, outdeg)], 
+            by.x = "from", by.y = "id")
+tmp_cols <- c("indeg", "outdeg")
+df[, (tmp_cols) := lapply(.SD, as.factor), .SDcols = tmp_cols]
+df[, ID:=1:.N]
+setnames(df, old=c("y", "from", "to", "indeg", "outdeg"),
+         new=c("E", "INVESTOR", "INVESTEE", "INDEG", "OUTDEG"))
+
+dbWriteFactorTable(conn=db, 
+                   name="EDGES", 
+                   df, append=T, row.names=F)
+
+fit2 <- bigglm(E ~ INDEG + OUTDEG, 
+               data = dbReadFactorTable(db, "EDGES", ""), 
+               family=binomial(), chunksize=10000, maxit=10)
+```
+
+```{r}
+nodes <- as_data_frame(g, "vertices")
+setDT(nodes)
+
+deg_dist <- nodes[, .(pr = .N), by=c("indeg", "outdeg")]
+# deg_dist[, pr:=pr/sum(pr)]
+deg_dist$indeg <- as.factor(deg_dist$indeg)
+deg_dist$outdeg <- as.factor(deg_dist$outdeg)
+deg_mat <- model.matrix(pr ~ indeg + outdeg - 1, deg_dist, 
+                        contrasts.arg = lapply(deg_dist[,1:2], contrasts, contrasts=FALSE))
+
+edge.df <- as.data.table(get.edgelist(g))
+edge.df$y <- 1
+df <- merge(edge.df, nodes[, .(name, indeg)], 
+            by.x = "V2", by.y = "name", all.x = T)
+df <- merge(df, nodes[, .(name, outdeg)], 
+            by.x = "V1", by.y = "name", all.x = T)
+df[, indeg := factor(indeg, levels = c(0, sort(unique(indeg))))]
+df[, outdeg := factor(outdeg, levels = c(0, sort(unique(outdeg))))]
+setnames(df, old = c("V1", "V2"), new = c("from", "to"))
+# df_sub <- df[sample(1:.N, 100000)]
+df_sub_mat <- model.matrix(y ~ indeg + outdeg - 1, df, 
+                           contrasts.arg = lapply(df[,4:5], contrasts, contrasts=FALSE))
+
+w_l <- length(c(levels(deg_dist$indeg), levels(deg_dist$outdeg)))
+w <- rep(0, w_l)
+
+lossLogistic <- function(w){
+  le <- sum(-log(1 + exp(deg_mat %*% w)) * deg_dist$pr)
+  l <- sum(df_sub_mat %*% w)
+  return(-(le + l))
+}
+
+g <- colSums(df_sub_mat)
+gr <- function(w) {
+  ge <- t(deg_mat) %*% ((1/(1 + exp(deg_mat %*% w)) - 1) * deg_dist$pr)
+  return(ge + g)
+}
+system.time(
+  ret <- optim(w, lossLogistic, method = "BFGS", control=list(trace=TRUE))
+)
+```
+
+```{r}
+fit <- readRDS("../misc/edge_2012_fit_5k_edges.RDS")
+
+fit.coef <- coef(fit)
+fit.coef.names <- names(fit.coef)  
+
+fit.coef.indeg.idx <- grep("INDEG", fit.coef.names)
+plot(fit.coef[fit.coef.indeg.idx])
+
+fit.coef.outdeg.idx <- grep("OUTDEG", fit.coef.names)
+plot(fit.coef[fit.coef.outdeg.idx])
+```
+
+### Approxiamte solution 
+
+```{r}
+n <- 10000
+p <- 3
+y <- sample(c(1,0), n, replace = T)
+x <- matrix(rnorm(n*p), ncol = p)
+
+
+# glm
+fit.tmp <- glm(y~x-1, family = binomial(link = "logit"))
+fit.tmp <- bigglm(y~V1+V2+V3-1, 
+                  family = binomial(link = "logit"), 
+                  chunksize=10, 
+                  data = as.data.frame(cbind(x, y)),
+                  sandwich = T)
+
+fit.list <- list()
+slice <- 10
+for(i in 1:slice) {
+  slice.size <- n/slice
+  idx <- (1+(i-1)*slice.size) : (i*slice.size)
+  fit.list[[i]] <- glm(y[idx]~x[idx,]-1,  family = "binomial")
+}
+
+w.list <- lapply(fit.list, function(x) solve(vcov(x)))
+fit.hat <- solve(Reduce('+', w.list)) %*% rowSums(mapply(function(x, y) x$coef %*% y, fit.list, w.list))
+fit.hat.0 <- rowMeans(sapply(fit.list, function(x) coef(x)))
+sum((coef(fit.tmp) - fit.hat)^2)
+sum((coef(fit.tmp) - fit.hat.0)^2)
+
+
+### linear
+fit.tmp <- lm(y~x-1)
+qr.tmp <- fit.tmp$qr$qr
+qr.tmp <- qr.tmp[1:ncol(qr.tmp), 1:ncol(qr.tmp)]
+qr.tmp[lower.tri(qr.tmp)] <- 0
+t(qr.tmp) %*% qr.tmp
+
+fit.list <- list()
+slice <- 10
+for(i in 1:slice) {
+  slice.size <- n/slice
+  idx <- (1+(i-1)*slice.size) : (i*slice.size)
+  fit.list[[i]] <- lm(y[idx]~x[idx, ]-1)
+}
+
+w.list <- lapply(fit.list, function(x) {
+  qr.tmp <- x$qr$qr
+  qr.tmp <- qr.tmp[1:ncol(qr.tmp), 1:ncol(qr.tmp)]
+  qr.tmp[lower.tri(qr.tmp)] <- 0
+  t(qr.tmp) %*% qr.tmp})
+
+w.list <- lapply(fit.list, function(x) solve(vcov(x)/(summary(x)$sigma)^2))
+fit.hat <- solve(Reduce(`+`, w.list)) %*% rowSums(mapply(function(x, y) x$coef %*% y, fit.list, w.list))
+coef(fit.tmp) - fit.hat
+```
+
+## Properties
+
+### Motif
+
+Dyad
+
++ mut: The number of pairs with mutual connections (in our case, spouses).
++ asym: The number of pairs with non-mutual connections (in the original network: mother-child and father-child + relationships; but in the undirected network, there are none).
++ null: The number of pairs with no connection between them.
+
+
+Triad
+
+```{r}
+g <- readRDS("output/g_2012_no_dangling.RDS")
+dyad <- dyad_census(g)
+triad <- triad_census(g)
+```
+
+
+###
+```{r}
+# pacman::p_load(network)
+# adj_network <- network(as_adjacency_matrix(g), directed = TRUE)
+```
+
+## Community
+
+We can get rid of the 1.4m leaves with only one investor first.
+
+```{r}
+## 1/8/2020
+g_lar <- readRDS("output/g_lar_2012.RDS")
+
+g_lar_edges <- as_data_frame(g_lar, "edges")
+setDT(g_lar_edges)
+g_lar_nodes <- as_data_frame(g_lar, "vertices")
+setDT(g_lar_nodes)
+
+one_investor <- g_lar_edges[, .N, by = to][N==1]
+leaves <- V(g_lar)$name[V(g_lar)$leaf == 1]
+one_investor_leaves <- intersect(one_investor$to, leaves)
+g_lar_sub <- induced.subgraph(g_lar, V(g_lar)[!(V(g_lar)$name %in% one_investor_leaves)])
+
+cll <- cluster_louvain(as.undirected(g_lar_sub))
+
+clfg <- cluster_fast_greedy(as.undirected(simplify(g_lar)))
+# cleigen <- leading.eigenvector.community(as.undirected(g_lar))
+clim <- cluster_infomap(g_lar)
+
+cl_em <- embed_adjacency_matrix(g_lar, 100)
+# cl_em <- readRDS("output/svd_100.RDS")
+plot(cl_em$D)
+dim_select(cl_em$D)
+
+idx <- sample(1:nrow(cl_em$X), 10000)
+plot(cl_em$X[idx,10], cl_em$X[idx,10])
+
+g_2 <- extract_cc(g, which = 2:3)
+g_2_mat <- as_adjacency_matrix(g_2, sparse = F)
+g_2_mat = g_2_mat[order(cl_2$membership), order(cl_2$membership)]
+image(t(g_2_mat))
+cl2_em <- embed_adjacency_matrix(g_2, 2)
+plot(cl2_em$D)
+plot(cl2_em$X[,1], cl2_em$X[,2])
+
+cl_2 <- clusters(g_2)
+plot(cl2_em$X, col=c("green", "red")[cl_2$membership])
+
+cl2_eigen <- cluster_leading_eigen(as.undirected(g_2))
+
+```
+
+
+```{r largest cluster community}
+# g_lar_2012_paj <- read.paj("misc/g_lar_2012.paj")
+# g_lar_2012_nodes$community <- g_lar_2012_paj$partitions$Louvain.Communities.in.N1
+# clu <- fread("misc/g_lar_louvain_res_5.clu")
+# names(clu) <- "community"
+com <- clfg
+V(g_lar)$community <- com$membership
+g_lar_nodes$community <- com$membership
+
+g_lar_comm <- g_lar_nodes[, .N, community][order(N, decreasing = T)]
+summary(g_lar_nodes[, .N, community]$N)
+length(unique(g_lar_nodes[, community]))
+```
+
+```{r, echo=FALSE, fig.cap="", out.width = '100%'}
+knitr::include_graphics("../Tables_Figures/Adjacency_Matrix/2012_by_community.png")
+```
+
+```{r adj mat community, message=FALSE, warning=FALSE, eval=F}
+idx <- sort(g_lar_nodes$community)
+image(g[][idx,idx])
+
+g_lar_nodes <- g_lar_nodes[order(community),]
+g_lar_edges <- get.data.frame(g_lar, "edges")
+g_lar_community <- graph_from_data_frame(g_lar_edges, T, g_lar_nodes)
+g_lar_adj <- as_adjacency_matrix(g_lar_community)
+
+image(g_lar_adj, 
+      scales=list(y=list(at=table(V(g_lar_community)$community),
+                         labels=rownames(table(V(g_lar_community)$community))),
+                  x=list(at=table(V(g_lar_community)$community),
+                         labels=rownames(table(V(g_lar_community)$community)),
+                         rot=90)),
+      main="2012 Adjacency Matrix of the largest cluster by community")
+
+```
+
+```{r some community by firm, eval = F}
+# largest 
+View(g_lar_nodes[community==g_lar_comm$community[2]][order(-reg_cap)])
+
+View(g_lar_nodes[grep("铁路", g_lar_nodes$firmname)][order(-reg_cap)])
+
+# Haier community
+View(g_lar_nodes[community==g_lar_nodes[name=="5792800",community]])
+# Huawei community
+View(g_lar_nodes[community==g_lar_nodes[name=="1290817",community]])
+# Ping'an
+View(g_lar_nodes[community==g_lar_nodes[name=="540837",community]])
+View(g_lar_nodes[community==g_lar_nodes[name=="540842",community]])
+# huijin
+View(g_lar_nodes[community==g_lar_nodes[name=="566575",community]])
+
+# railway
+View(g_lar_nodes[community==g_lar_nodes[name=="768500",community]][order(-reg_cap)])
+
+
+write.graph(induced.subgraph(g_lar, V(g_lar)[which(V(g_lar)$community==1260 | V(g_lar)$community==5588)]),
+            "misc/pingan.graphml", "graphml")
+
+comm_idx <- g_lar_nodes[name=="5792800",community]
+write.graph(induced.subgraph(g_lar, V(g_lar)[which(V(g_lar)$community== comm_idx)]),
+            "output/haier.graphml", "graphml")
+
+# huijin substree
+tmp = extract_tree(g_lar, id = "566575")
+write.graph(tmp, "output/huijin_2.graphml", "graphml")
+
+# state grid
+tmp = extract_tree(g, id = "1828130")
+write.graph(tmp, "output/state_grid.graphml", "graphml")
+
+# An'bang 2254354 2254350
+View(g_lar_nodes[community==g_lar_nodes[name=="2254354",community]])
+View(g_lar_nodes[community==g_lar_nodes[name=="2254350",community]])
+```
+
+### Pingan
+```{r Pingan tree}
+community_id <- unique(g_lar_2012_nodes[grep("中国平安", g_lar_2012_nodes$firmname), community] )
+ids <- g_lar_2012_nodes[community %in% community_id, name]
+g_pingan <- induced.subgraph(g_lar, V(g_lar)[name %in% ids])
+versize <- V(g_pingan)$reg_capital
+versize[which(is.na(versize))] <- 1
+versize <- 1e-5 * versize
+
+plot(g_pingan, layout=layout_as_tree(g_pingan), vertex.label.dist=0.5,
+     vertex.size=versize) 
+
+```
+
+
+```{r community graph}
+# get the max reg cap of each community
+g_lar_2012_top_reg_cap_nodes <- g_lar_2012_nodes[is.na(reg_capital), reg_capital:=0
+                                                 ][,.SD[which.max(reg_capital)], by=community]
+g_lar_2012_top_reg_cap_nodes[,.N,indus][order(N,decreasing = T)]
+g_lar_2012_top_reg_cap_nodes[,.N,ownership][order(N, decreasing = T)]
+
+# aggregate community nodes
+# aggregate industry and ownership by taking the majority
+community_nodes <- g_lar_2012_nodes[is.na(reg_capital), reg_capital:=0
+                                    ][,.(sum_reg_cap=sum(reg_capital),
+                                         num=.N,
+                                         majority_indus=names(which.max(table(indus))),
+                                         majority_indus_rate=which.max(table(indus))/.N,
+                                         majority_ownership=names(which.max(table(ownership)))),community]
+community_nodes <- merge(community_nodes, g_lar_2012_top_reg_cap_nodes[,.(community, 
+                                                                          top_reg_cap_firm=firmname,
+                                                                          top_firm_ownership=ownership)],
+                         by="community")
+
+## cross indus within cluster
+## 
+View(community_nodes[order(sum_reg_cap/num,decreasing = T)])
+
+community_nodes[majority_indus_rate>0.05,.N]/nrow(community_nodes)
+
+# aggregate community edges
+# aggregate cash by each edge between communities
+# aggregate share (weight) by cash/sum_reg_cap
+g_lar_2012_edges <- get.data.frame(g_lar, "edges")
+g_lar_2012_edges <- setDT(g_lar_2012_edges)
+g_lar_2012_edges <- merge(g_lar_2012_edges, g_lar_2012_nodes[,.(name,from_community=community)], 
+                          by.x="from", by.y="name")
+g_lar_2012_edges <- merge(g_lar_2012_edges, g_lar_2012_nodes[,.(name,to_community=community)], 
+                          by.x="to", by.y="name")
+community_edges <- g_lar_2012_edges[,.(sum_cash = sum(weight, na.rm = T),
+                                       num = .N), by=c("from_community", "to_community")]
+community_edges <- merge(community_edges, community_nodes[,.(community, sum_reg_cap)], 
+                         by.x="to_community", by.y="community")
+community_edges <- community_edges[, weight:=sum_cash/sum_reg_cap*100]
+setnames(community_edges, old=c("from_community", "to_community"), new=c("from", "to"))
+
+# community network
+g_community <- graph_from_data_frame(community_edges, T, community_nodes)
+
+write.graph(g_community,"misc/g_2012_lar_community_graph.graphml", "graphml")
+
+# isolated cluster?
+community_edges[,.(from,.N),by=to][N==1]
+```
+
+
+### Largest cluster
+```{r largest cluster, eval=F}
+cl <- clusters(g)
+cl$csize[order(cl$csize, decreasing = T)][1:10]
+# gp <- groups(cl)
+# # dangling firm
+# sum(cl$csize==1)
+# gp_stack <- stack(gp)
+# names(gp_stack) <- c("id", "group")
+# nodes_2012 <- merge(gp_stack, nodes_2012, by.x="id", by.y="name")
+# nodes_2012 <- as.data.table(nodes_2012)
+#
+# nodes_2012_rank_by_group <- nodes_2012[,.N,by=group][order(N,decreasing = T)]
+# nodes_2012_rank_by_group$ranked_group <- seq(1,nrow(nodes_2012_rank_by_group))
+# nodes_2012 <- merge(nodes_2012, nodes_2012_rank_by_group, by="group")
+#
+#
+# top_eigen <- nodes_2012[order(nodes_2012$eigen, decreasing = T),eigen][1000]
+# nodes_2012[eigen>top_eigen,.N,by=ranked_group]
+#
+# top_reg_cap <- nodes_2012[order(nodes_2012$reg_capital, decreasing = T), reg_capital][1000]
+# nodes_2012[reg_capital>top_reg_cap,.N,by=ranked_group][order(N,decreasing = T)]
+#
+# sum_reg_cap <- nodes_2012[,sum(reg_capital, na.rm = T)]
+# sum_reg_cap_by_group <- nodes_2012[,sum(reg_capital, na.rm = T)/sum_reg_cap, ranked_group]
+# sum_reg_cap_by_group[order(ranked_group,decreasing = F)]
+#
+# head(nodes_2012[order(nodes_2012[,(eigen)], decreasing=T)])
+# eigen_by_group <- nodes_2012[,sum(eigen),by=ranked_group]
+# eigen_by_group[order(eigen_by_group$V1, decreasing = T)]
+#
+# indeg_by_group <- nodes_2012[,sum(indeg),by=ranked_group]
+# indeg_by_group[order(indeg_by_group$V1, decreasing = T)]
+
+
+
+
+hist(log(cl$csize))
+g_lar <- induced.subgraph(g, V(g)[which(cl$membership==which(cl$csize==max(cl$csize)))])
+# reg cap of largest
+g_lar_2012_nodes <- V(g_lar)$name
+basic_info[which(basic_info$reg_capital == max(basic_info$reg_capital) ), reg_capital:=NA]
+basic_info[new_entid%in%g_lar_2012_nodes, sum(reg_capital, na.rm = T)]/basic_info[,sum(reg_capital, na.rm = T)]
+
+sum(E(g_lar)$weight, na.rm = T)
+
+nodes_lar <- get.data.frame(g_lar, "vertices")
+nodes_lar <- setDT(nodes_lar)
+nodes_lar$indeg <- degree(g_lar, mode="in")
+nodes_lar$outdeg <- degree(g_lar, mode="out")
+# E(g_lar)$weight[E(g_lar)$weight==0] <- 1
+# E(g_lar)$weight[is.na(E(g_lar)$weight)] <- 1
+# nodes_lar$between <- estimate_betweenness(g_lar, directed = T, cutoff = 4)
+# nodes_lar$closeness <- closeness(g_lar, mode = "out")
+# nodes_lar$eigen <- eigen_centrality(g_lar, directed = T)
+
+# extract those with 0 in-deg as root
+nodes_lar[indeg==0,.N]/nodes_lar[,.N] # 21%
+nodes_lar[indeg==0, .N, ownership]
+nodes_lar[indeg==0, .N, by=indus]
+nodes_lar[indeg==0, median(reg_capital, na.rm=T), ownership]
+
+roots <- nodes_lar[,name]
+roots_bfs <- lapply(roots, function(x) dfs(g_lar, x, neimode = "out", unreachable = F, dist=T))
+```
+
+
+```{r}
+g_lar <- extract_cc(g, which = 1)
+mat_lar <- as_adjacency_matrix(g_lar)
+nodes_lar <- as_data_frame(g_lar, "vertices")
+setDT(nodes_lar)
+edges_lar <- as_data_frame(g_lar, "edges")
+setDT(edges_lar)
+
+# svd
+# svd_lar <- svd(mat_lar)
+# plot(svd_lar$d)
+svd_lar <- irlba::svdr(mat_lar, k = 2)
+
+sum(svd_lar$u[,1] > 1e-10)
+sum(svd_lar$v[,1] != 0)
+
+hub_lar <- which(svd_lar$u[,1] > 1e-10)
+nodes_lar[, hub:=svd_lar$u[,1]]
+nodes_lar[hub_lar]
+table(nodes_lar[hub_lar, root])
+
+tar <- nodes_lar[hub > 1e-10 & root == 0, which = TRUE]
+
+dist_to_roots <- lapply(V(g_lar)[tar][1:10], function(r) {
+  max(bfs(g_lar, r, neimode = "in", unreachable = F, dist = T)$dist, na.rm=T)
+})
+
+nodes[name %in% names(dist_to_roots)]
+
+nei <- neighborhood.size(g_lar, 5, nodes=root_lar)
+
+# tree
+root_lar <- V(g_lar)[V(g_lar)$root == 1]
+bfs_lar <- lapply(root_lar[1:10], function(r) {
+  dist <- bfs(g_lar, r, neimode = "out", unreachable = F, dist = T)$dist;
+  dist <- dist[!is.na(dist)]
+})
+
+t_size_lar <- sapply(bfs_lar, function(t) length(t))
+t_depth_lar <- sapply(bfs_lar, function(t) max(t, na.rm=T))
+```
+
+
+
+### Second largest
+```{r}
+g_sublar <- extract_cc(g, which = 2)
+mat_sublar <- as_adjacency_matrix(g_sublar, attr = "weight")
+nodes_sublar <- as_data_frame(g_sublar, "vertices")
+setDT(nodes_sublar)
+edges_sublar <- as_data_frame(g_sublar, "edges")
+setDT(edges_sublar)
+
+# svd
+svd_sublar <- svd(mat_sublar)
+plot(svd_sublar$d)
+svd_sublar <- irlba::svdr(mat_sublar, k = 2)
+
+sum(svd_sublar$u[,1] != 0)
+sum(svd_sublar$v[,1] != 0)
+
+hub_sublar <- which(svd_sublar$u[,1] != 0)
+nodes_sublar[, hub:=svd_sublar$u[,1]]
+nodes_sublar[hub_sublar]
+edges_sublar[to == "505918"]
+View(edges_sublar)
+
+vsize <- rep(0.1, nrow(mat_sublar))
+vsize[hub_sublar] <- 10
+vlab <- rep(NA, nrow(mat_sublar))
+vlab[hub_sublar] <- V(g_sublar)$name[hub_sublar]
+plot(g_sublar, vertex.size = vsize, vertex.label = vlab ,edge.arrow.size=0.5)
+
+# tree
+root_sublar <- V(g_sublar)[V(g_sublar)$root == 1]
+bfs_sublar <- lapply(root_sublar, function(r) {
+  dist <- bfs(g_sublar, r, neimode = "out", unreachable = F, dist = T)$dist;
+  dist <- dist[!is.na(dist)]
+})
+
+t_size_sublar <- sapply(bfs_sublar, function(t) length(t))
+t_depth_sublar <- sapply(bfs_sublar, function(t) max(t, na.rm=T))
+
+```
+
+## Tree
+
+
+```{r}
+# src/root_tree.R generates trees from roots
+# src/root_tree_mat.R generates sparse matrix of distances from roots
+opt <- NULL
+opt$year <- 2012
+tree_mat <- readRDS("output_hpcc/tree_mat_2012.RDS")
+nodes_name <- readRDS(paste0("output_old_data/nodes_name_", opt$year, ".RDS"))
+
+root_name <- nodes_lar[root == 1, name]
+child_name <- setdiff(colnames(tree_mat), root_name)
+tree_mat <- tree_mat[, match(child_name, colnames(tree_mat))]
+trees <- as.data.table(summary(tree_mat))
+trees[, roots := as.integer(rownames(tree_mat)[i]) ]
+trees[, desc := as.integer(colnames(tree_mat)[j]) ]
+
+# saveRDS(trees, "output_hpcc/tree_df_2012.RDS")
+```
+
+
+```{r}
+g <- readRDS("output/g_2012_no_dangling_cent.RDS")
+nodes <- as_data_frame(g, what = c("vertices"))
+setDT(nodes)
+g_lar <- extract_cc(g, which = 1)
+
+opt <- NULL
+opt$year <- 2012
+nodes_name <- readRDS(paste0("output/nodes_name_", opt$year, ".RDS"))
+trees <- readRDS("output/tree_df_2012.RDS")
+trees[,i:=NULL]; trees[,j:=NULL]
+
+ntree <- trees[,.N,desc]
+# mntree <- merge(ntree, nodes_lar[,.(name, indeg)], by="name")
+
+# tree with pure children
+tpc <- merge(ntree[N == 1,.(desc)], trees, by="desc")
+plot_discrete_range(tpc$x, name = "depth of pure children") + theme_bw()
+ggsave("output/tables_figures/depth_pure.pdf", width = 8, height = 4)
+
+# non pure children
+npc <- merge(ntree[N > 1,.(desc)], trees, by="desc")
+plot_discrete_range(npc[,min(x),desc]$V1, name = "min depth of non-pure children") + theme_bw()
+ggsave("output/tables_figures/depth_nonpure_min.pdf", width = 8, height = 4)
+plot_discrete_range(npc[,max(x),desc]$V1, name = "max depth of non-pure children") + theme_bw()
+ggsave("output/tables_figures/depth_nonpure_max.pdf", width = 8, height = 4)
+
+
+# tree depth
+tree_depth <- trees[,max(x),roots]
+plot_discrete_range(tree_depth$V1) 
+
+# tree size
+tree_size <- trees[,.N,roots]
+plot_discrete_range(tree_size$N, range = c(NA, 20))
+
+# tree distribution
+tree_dist <- trees[,.N,by=c("roots","x")]
+tpc_roots <- unique(tpc,by =  "roots")
+tree_dist <- merge(tree_dist, tpc_roots[, .(roots, desc)], by="roots", all.x=T)
+tree_dist[, tpc := ifelse(is.na(desc), 0, 1)]
+
+tree_dist_by_tpc <- tree_dist[, median(N), c("x", "tpc")]
+tree_dist_by_tpc %>%
+  ggplot(aes(x = x, y = V1, col = tpc, group = tpc)) +
+  geom_line() + geom_point()
+
+roots <- unique(trees$roots)
+sample_idx <- sample(seq_along(roots), 1000)
+tree_dist[roots %in% roots[sample_idx]] %>%
+  ggplot(aes(x = x, y = N, col = factor(tpc), group = roots)) +
+  geom_line() + geom_point()
+```
+
+
+### Pure children tree
+```{r}
+tpc_nodes_name <- unique(c(tpc$desc, tpc$roots))
+g_tpc <- induced.subgraph(g_lar, V(g_lar)[V(g_lar)$name %in% tpc_nodes_name])
+
+# more controlling as expected
+nodes_tpc <- as_data_frame(g_tpc, "vertices")
+setDT(nodes_tpc)
+tmp <- data.table(desc = tpc_roots$roots,
+                  x = 0,
+                  roots = tpc_roots$roots)
+nodes_tpc <- merge(nodes_tpc,  rbind(tpc[, desc:=as.character(desc)], tmp), 
+                   by.x="name", by.y="desc", all.x=T)
+setorder(nodes_tpc, "roots", "x")
+
+edges_tpc <- as_data_frame(g_tpc, "edges")
+setDT(edges_tpc)
+hist(edges_tpc$weight, freq = F)
+hist(edges_lar$weight, freq = F)
+
+edges_tpc[, sum(weight>.5)/.N]
+edges_lar[, sum(weight>.5)/.N]
+```
+
+
+### Non-pure children tree
+```{r}
+npc_nodes_name <- unique(c(npc$desc, npc$roots))
+g_npc <- induced.subgraph(g_lar, V(g_lar)[V(g_lar)$name %in% npc_nodes_name])
+
+# find mixed children
+mpc <- edges_lar[to %in% unique(npc$desc)]
+mpc <- merge(mpc, tpc, by.x="from", by.y="desc")
+mpc_node_names <- mpc$from
+mpc_node_names <- unique(mpc_node_names)
+
+# for(k in 1:max(mpc$x)) {
+#   print(k)
+#   mpc <- merge(edges_lar, mpc[x!=1, .(from,x,roots)], by.x="to", by.y="from")
+#   mpc <- merge(mpc, tpc[,.(desc)], by.x="from", by.y="desc")
+#   mpc_node_names <- c(mpc_node_names, mpc$from)
+# }
+# 
+# mpc_node_names <- unique(mpc_node_names)
+## chain of pure children cross-investing
+# saveRDS(mpc_node_names, "output/mixed_chain_2012.RDS")
+nodes_tpc[name %in% mpc_node_names, mixed := 1]
+
+# more controlling as expected
+nodes_npc <- as_data_frame(g_npc, "vertices")
+setDT(nodes_npc)
+npc_roots <- unique(npc,by =  "roots")
+tmp <- data.table(desc = npc_roots$roots,
+                  x = 0,
+                  roots = npc_roots$roots)
+nodes_npc <- merge(nodes_npc,  rbind(npc[, desc:=as.character(desc)], tmp), 
+                   by.x="name", by.y="desc", all.x=T)
+setorder(nodes_npc, "roots", "x")
+
+edges_npc <- as_data_frame(g_npc, "edges")
+setDT(edges_npc)
+hist(edges_npc$weight, freq = F)
+hist(edges_lar$weight, freq = F)
+
+edges_npc[, sum(weight>.5)/.N]
+edges_lar[, sum(weight>.5)/.N]
+
+## average number of roots
+hist(npc[,.N,desc]$N)
+npc[,.N,desc][N==3]
+```
+
+### Plot tree
+```{r}
+# 6615989, 25448, 549
+roots_sub <- trees[desc== 6615989, roots]
+npc_sub <- trees[roots %in% roots_sub]
+# npc_sub <- npc_sub[x <= 3]
+npc_sub[, roots := as.character(roots)]
+npc_sub[, desc := as.character(desc)]
+npc_sub_nodes_name <- unique(c(npc_sub$desc, npc_sub$roots))
+g_npc_sub <- induced.subgraph(g_lar, V(g_lar)[V(g_lar)$name %in% npc_sub_nodes_name])
+
+nodes_npc_sub <- as_data_frame(g_npc_sub, "vertices")
+setDT(nodes_npc_sub)
+edges_npc_sub <- as_data_frame(g_npc_sub, "edges")
+setDT(edges_npc_sub)
+edges_npc_sub <- merge(edges_npc_sub,
+                       npc_sub[,.(min(x)), by="desc"],
+                       by.x = "from", by.y = "desc", all.x = T)
+edges_npc_sub <- merge(edges_npc_sub,
+                       npc_sub[,.(min(x)), by="desc"],
+                       by.x = "to", by.y = "desc", all.x = T)
+edges_npc_sub <- merge(edges_npc_sub,
+                       nodes_npc_sub[,.(name, indus, root)],
+                       by.x = "to", by.y = "name", all.x = T)
+edges_npc_sub <- edges_npc_sub[order(as.numeric(from), as.numeric(to))]
+edges_npc_sub[is.na(V1.x), V1.x:= -1]
+edges_npc_sub[is.na(V1.y), V1.y:= -2]
+
+indus <- factor(nodes_npc_sub$indus)
+cols <- rainbow(11)
+cols <- RColorBrewer::brewer.pal(11, "Spectral")
+cols <- c('#fabebe','#e6194b', '#f58231', '#ffe119', '#bcf60c', 
+          '#46f0f0', '#3cb44b', '#008080', '#4363d8', '#911eb4', 
+          '#f032e6', '#e6beff', '#9a6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1', '#000075', '#808080', '#ffffff', '#000000')
+cols2 <- colorRampPalette(c("red", "yellow"))(nrow(nodes_npc_sub))
+
+pdf("output/tables_figures/tree_6615989.pdf", width = 8, height = 6)
+par(mar=c(1.1, 1.1, 1.1, 10.1), xpd=TRUE, bg = "white")
+plot(g_npc_sub,
+     layout=layout_as_tree(g_npc_sub,
+                           root = which(nodes_npc_sub$name %in% roots_sub)),
+     layout = layout.fruchterman.reingold,
+     vertex.size = log(nodes_npc_sub$eigen_c+1.5)*5, 
+     edge.arrow.size = .5,
+     vertex.dist = 20, 
+     vertex.color = cols[indus],
+     vertex.label = substr(nodes_npc_sub$firmname, 1, 8),
+     # vertex.label = NA,
+     vertex.label.cex = log(nodes_npc_sub$eigen_c+1.5),
+     vertex.label.dist = runif(nrow(nodes_npc_sub), -1, 1),
+     vertex.label.color = "black",
+     edge.width = E(g_npc_sub)$weight*4,
+     edge.arrow.size = .10,
+     edge.arrow.width = E(g_npc_sub)$weight,
+     edge.lty = c(1,2)[ifelse(E(g_npc_sub)$weight>.5, 1,2)], 
+     edge.color = cols[factor(edges_npc_sub$indus)],
+     edge.curved = ifelse(edges_npc_sub$V1.x == edges_npc_sub$V1.y, T, F))
+legend("right", inset = c(-1.3, 0), 
+       legend = levels((indus)), 
+       col = cols[seq_along(levels(indus))], 
+       pch = 16, cex = .8, bty='n', pt.cex = 2, y.intersp=.8, lty = 1, lwd = 2)
+dev.off()
+
+plot(cluster_fast_greedy(as.undirected(g_npc_sub)), g_npc_sub,
+     layout=layout_as_tree(g_npc_sub,
+                           root = which(nodes_npc_sub$name %in% roots_sub)),
+     layout = layout.fruchterman.reingold,
+     vertex.size = log(nodes_npc_sub$eigen_c+1.5)*5, 
+     edge.arrow.size = .5,
+     vertex.dist = 20, 
+     vertex.color = cols[indus],
+     vertex.label = substr(nodes_npc_sub$firmname, 1, 8),
+     # vertex.label = NA,
+     vertex.label.cex = (nodes_npc_sub$eigen_c+.1)*.1,
+     vertex.label.dist = runif(nrow(nodes_npc_sub), -1, 1),
+     vertex.label.color = "black",
+     edge.width = E(g_npc_sub)$weight*4,
+     edge.arrow.size = .10,
+     edge.arrow.width = E(g_npc_sub)$weight,
+     edge.lty = c(1,2)[ifelse(E(g_npc_sub)$weight>.5, 1,2)], 
+     edge.color = cols[factor(edges_npc_sub$indus)],
+     edge.curved = ifelse(edges_npc_sub$V1.x == edges_npc_sub$V1.y, T, F))
+
+
+# write.graph(g_npc_sub, "output/trees_6615989.graphml", "graphml")
+
+# sj_list <- igraph_to_networkD3(g_npc_sub, 
+#                                group = cluster_infomap(as.undirected(g_npc_sub))$membership)
+# sj_list$nodes$firmanme <- as_data_frame(g_npc_sub, "vertices")$firmname
+# forceNetwork(Links = as_data_frame(g_npc_sub, "edges"), 
+#              Nodes = as_data_frame(g_npc_sub, "vertices"), 
+#              Source = 'from',
+#              Target = 'to', NodeID = 'name', Group = 'indeg',
+
+# pacman::p_load("HCD")
+# mat_npc_sub <- as_adjacency_matrix(g_npc_sub)
+# hcd_lar <- HCD(mat_npc_sub, method = "SC")
+# hcd_lar$labels
+```
+
+### SOE
+
+```{r}
+g_lar <- readRDS("output/g_lar_2017.RDS")
+trees <- readRDS("output/tree_central_2017.RDS")
+top <- fread("../Data_Paper2_Who_Control_China_Ecnomy/control_layers/soe_layer_by_layer_central_0_2017.csv",
+             encoding = "UTF-8")
+central <- top[central==1 & soe_layer == 1]
+central$new_entid <- as.character(central$new_entid)
+
+ntree <- trees[,.N,by=desc]
+nc <- merge(trees[,.N,by=root], central[,.(firm_name, new_entid)], by.x="root", by.y="new_entid")
+nc <- nc[order(-N)]
+
+root_node <- "551444"
+citic <- extract_tree(g_lar, "528652")
+citic_tree <- trees[root==root_node]
+
+npc_sub <- citic_tree[x <= 3 & ctrl & weight == 1]
+g_npc_sub <- induced.subgraph(g_lar, V(g_lar)[V(g_lar)$name %in% unique(c(npc_sub$root,npc_sub$desc))])
+
+nodes_npc_sub <- as_data_frame(g_npc_sub, "vertices")
+setDT(nodes_npc_sub)
+edges_npc_sub <- as_data_frame(g_npc_sub, "edges")
+setDT(edges_npc_sub)
+edges_npc_sub <- merge(edges_npc_sub,
+                       npc_sub[,.(min(x)), by="desc"],
+                       by.x = "from", by.y = "desc", all.x = T)
+edges_npc_sub <- merge(edges_npc_sub,
+                       npc_sub[,.(min(x)), by="desc"],
+                       by.x = "to", by.y = "desc", all.x = T)
+edges_npc_sub <- merge(edges_npc_sub,
+                       nodes_npc_sub[,.(name, indus, root)],
+                       by.x = "to", by.y = "name", all.x = T)
+edges_npc_sub <- edges_npc_sub[order(as.numeric(from), as.numeric(to))]
+edges_npc_sub[is.na(V1.x), V1.x:= -1]
+edges_npc_sub[is.na(V1.y), V1.y:= -2]
+
+
+cols <- colorRampPalette(brewer.pal(name="Spectral", n = 11))(14)
+cols <- RColorBrewer::brewer.pal(11, "Spectral")
+cols <- c('#fabebe','#e6194b', '#f58231', '#ffe119', '#bcf60c', 
+          '#46f0f0', '#3cb44b', '#008080', '#4363d8', '#911eb4', 
+          '#f032e6', '#e6beff', '#9a6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1', '#000075', '#808080', '#ffffff', '#000000')
+cols2 <- colorRampPalette(c("red", "yellow"))(nrow(nodes_npc_sub))
+
+indus <- factor(nodes_npc_sub$indus)
+v.col <- cols[as.numeric(indus)]
+v.col[is.na(v.col)] <- "white"
+e.col <- cols[as.numeric(factor(edges_npc_sub$indus))]
+e.col[is.na(e.col)] <- "grey80"
+v.size <- log(nodes_npc_sub$reg_cap+1)
+v.size[is.na(v.size)] <- 0
+
+png("output/tables_figures/tree_sinopec_100.png", width = 1800, height = 1200)
+par(mar=c(1.1, 1.1, 1.1, 10.1), xpd=TRUE, bg = "white")
+plot(g_npc_sub,
+     layout=layout_as_tree(g_npc_sub,
+                           root = which(nodes_npc_sub$name %in% root_node)),
+     # layout = layout.fruchterman.reingold,
+     vertex.size = v.size,
+     edge.arrow.size = .5,
+     vertex.dist = 20, 
+     vertex.color = v.col,
+     vertex.label = substr(nodes_npc_sub$firmname, 1, 6),
+     # vertex.label = NA,
+     vertex.label.cex = log(nodes_npc_sub$reg_cap+1)*2e-1,
+     vertex.label.dist = c(0, runif(nrow(nodes_npc_sub)-1, -2, 2)),
+     vertex.label.color = "black",
+     edge.width = E(g_npc_sub)$weight*4,
+     edge.arrow.size = 1,
+     edge.arrow.width = E(g_npc_sub)$weight,
+     edge.lty = c(1,2)[ifelse(E(g_npc_sub)$weight>.5, 1, 2)], 
+     # edge.color = "black",
+     edge.color = e.col,
+     edge.curved = ifelse(edges_npc_sub$V1.x == edges_npc_sub$V1.y, T, F),
+     asp = .8)
+legend("right", inset = c(-1.3, 0), 
+       legend = levels((indus)), 
+       col = cols[seq_along(levels(indus))], 
+       pch = 16, cex = .8, bty='n', pt.cex = 2, y.intersp=.8, lty = 1, lwd = 2)
+dev.off()
+```
+
+
+## AIS
+```{r}
+ais_match <- fread("../AIS_CRCS_Matching/ASCIE_CRCS_matching.csv", 
+                   header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE, fill = TRUE)
+
+stck_match <- fread("../../China_Stock_Market_WZ/stck_entid_id_concordance.csv",
+                    header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE, fill = TRUE)
+stck_match[,V1:=NULL]
+
+panel <- fread("../AIS_CRCS_Matching/ascie_linda_project_final.csv",
+               header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE, fill = TRUE)
+panel <- fread("../AIS_CRCS_Matching/long_panel_1999_2013.csv",
+header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE, fill = TRUE)
+ais_varname <- fread("../AIS_CRCS_Matching/AIS_varname_match.csv", 
+                     header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE, fill = TRUE)
+ais_varname <- rbind(ais_varname,
+                     data.table(old = c("sszb", "fzhj", "zczj"),
+                                new = c("paidincap", "totaldebt", "totalassets")))
+
+col <- colnames(panel)
+idx <- ais_varname$old %in% col
+ais_varname <- ais_varname[idx, ]
+setnames(panel, old = ais_varname$old, new = ais_varname$new)
+
+panel <- merge(panel, stck_match, by = "new_entid", all.x = T)
+```
+
+### whollyowned
+```{r}
+wholly <- panel[type=="110"]
+wholly[,statecap := as.numeric(gjzb)/as.numeric(sszb)]
+
+topl <- fread("../Data_Paper2_Who_Control_China_Ecnomy/soe_layer_by_layer_central_100_1999_2017.csv",
+             encoding = "UTF-8")
+topl$year <- as.character(topl$year)
+topl[, intop:=1]
+
+wholly <- merge(wholly, 
+                topl[,.(new_entid, year, intop, csoe, csoe_layer, psoe, psoe_layer, lsoe, lsoe_layer)], 
+                by = c("new_entid", "year"),
+                all.x = T)
+wholly[,.N,by=intop]
+```
+
+### Tree
+```{r}
+tmp <- data.table(x = 0,
+                  roots = unique(trees$roots), 
+                  desc = unique(trees$roots))
+ais <- merge(rbind(trees, tmp), 
+             ais_match[year == 2012 & !is.na(new_entid)], 
+             by.x="desc", by.y = "new_entid", all.x=T)
+ais <- merge(ais[!is.na(firm_code)], panel[year == 2012],
+             by.x = "firm_code", by.y="id", all.x = T)
+
+# number of root
+sum(ais[!is.na(firm_code), x] == 0)
+par(mfrow = c(2,1))
+hist(ais[!is.na(firm_code), x])
+hist(trees[,x])
+
+# more cross-tree investment on avg
+mean(ais[!is.na(firm_code), .N, by="desc"]$N)
+mean(ais[, .N, by="desc"]$N)
+
+# 
+fit <- lm(fixedassets_gross ~ x, ais)
+summary(fit)
+plot(fit)
+
+## Pure tree
+tpc <- ais[!is.na(firm_code), .(.N, roots, x), by="desc"][N==1]
+panel_tpc <- merge(panel[year == 2012], tpc, by.x="new_entid", by.y="desc")
+
+# position of npc is much shallower 
+mean(ais[!is.na(firm_code) & x!=0, x])
+mean(tpc[x!=0]$x)
+
+#
+summary(lm(fixedassets_gross ~ x, panel_tpc))
+
+panel_sub <- merge(panel[year==2012], ais_match, 
+                   by.x = "id", by.y="firm_code", all.x = T)
+panel_sub_2 <- merge(network, panel_sub[,.(new_entid.x, totalassets)],
+                     by.x = "new_entid_invested", by.y="new_entid.x", all.x= T)
+panel_sub_sum <- panel_sub_2[, reg_cap_invested/totalassets, by="new_entid_invested"]
+panel_sub_sum <- panel_sub_2[, sum(cash, na.rm = T)/totalassets, by="new_entid_invested"]
+panel_sub_sum <- unique(panel_sub_sum, by="new_entid_invested")
+panel_sub_sum <- panel_sub_sum[V1<=1]
+hist(panel_sub_sum$V1)
+```
+
+
+### Comove
+```{r}
+new_entid_in_net <- panel[in_net == 1 & year == 2012, .(new_entid, growth_asset, TFP)]
+tmp <- merge(new_entid_in_net, trees, by.x = "new_entid", by.y = "roots")
+tmp <- unique(tmp, by = "new_entid")
+tmp[, x:= 0]
+tmp[, desc := new_entid]
+setnames(tmp, old = c("desc"), new = c("roots"))
+new_entid_in_net <- merge(new_entid_in_net, trees, by.x = "new_entid", by.y = "desc")
+new_entid_in_net <- rbind(new_entid_in_net, tmp)
+
+new_entid_in_net <- merge(new_entid_in_net, new_entid_in_net[,.N, roots][N!=1],
+                          by = "roots")
+setorder(new_entid_in_net,"N", "roots")
+fwrite(new_entid_in_net, "output/ais_in_net_tree_2012.csv")
+
+roots_in_net <- unique(new_entid_in_net$roots)
+saveRDS(roots_in_net[sample(seq_along(roots_in_net), length(roots_in_net))],
+        "output/ais_in_net_tree_roots_2012.RDS")
+
+# pairs_in_net <- new_entid_in_net[1:100+1e6, as.data.table(t(combn(new_entid, 2))), .(roots)]
+# 
+# library(foreach)
+# library(doParallel)
+# cl <- makeCluster(4)
+# registerDoParallel(cl)
+# 
+# foreach(ii = seq_along(roots_in_net), .combine = rbind) %dopar% {
+#   root <- roots_in_net[ii]
+#   sub_in_net <- new_entid_in_net[roots == root, as.data.table(t(combn(new_entid, 2))), .(roots)]
+#   
+# }
+```
+
+### Plots
+```{r}
+panel[, totaldebt_fixed := totaldebt]
+panel[totaldebt > totalassets, totaldebt_fixed := 0.99*totalassets]
+panel[, leverage := totaldebt_fixed/totalassets]
+panel[, equity_ratio := 1-leverage]
+
+# inout net
+panel[, in_net := T]
+panel[is.na(new_entid), in_net := F]
+
+# all weights
+tmp <- panel[, sum(as.numeric(totalassets), na.rm=T), "year"]
+panel[, V1:=NULL]
+panel <- merge(panel, tmp[year <= 2013 & year >= 1999], "year", all.x=T)
+panel[, w := totalassets/V1]
+
+# mean er
+panel[, .(ratio = mean(equity_ratio, na.rm=T)), "year"] %>%
+  filter(ratio >= 0) %>%
+  filter(year <= 2013 & year > 1998 & year != 2010) %>%
+  ggplot(aes(x = year, y = ratio, group  = 1))  + 
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 2000:2013) +
+  geom_line() + geom_point() + 
+  ylab("") + ggtitle("Mean equity ratio") +
+  theme_bw() + 
+  theme(text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(2.5,"line"))
+ggsave("../../Tables_Figures/Equity_structure/mean_equity_ratio.pdf",
+       width = 8, height = 4)
+fwrite(panel[, .(ratio = mean(equity_ratio, na.rm=T)), "year"],
+       "../../Tables_Figures/Equity_structure/mean_equity_ratio.csv")
+
+panel[, .(ratio = sum(w*equity_ratio, na.rm=T)), "year"] %>%
+  filter(ratio >= 0) %>%
+  filter(year <= 2013 & year > 1998 & year != 2010) %>%
+  ggplot(aes(x = year, y = ratio, group  = 1))  + 
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 2000:2013) +
+  geom_line() + geom_point() + 
+  ylab("") + ggtitle("Weighted mean equity ratio (by total assets)") +
+  theme_bw() + 
+  theme(text = element_text(size = 14),
+        legend.position="bottom", 
+        legend.key.width = unit(2.5,"line"))
+ggsave("../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio.pdf",
+       width = 8, height = 4)
+fwrite(panel[, .(ratio = sum(w*equity_ratio, na.rm=T)), "year"],
+       "../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio.csv")
+ggsave("../../Tables_Figures/Equity_structure/weighted_by_in_net_mean_equity_ratio.pdf",
+       width = 8, height = 4)
+fwrite(panel[, .(ratio = sum(w*equity_ratio, na.rm=T)), "year"],
+       "../../Tables_Figures/Equity_structure/weighted_by_in_net_mean_equity_ratio.csv")
+
+# In-out network
+# within group weights
+tmp <- panel[, sum(as.numeric(totalassets), na.rm=T), c("year", "in_net")]
+panel[, V1:=NULL]
+panel <- merge(panel, tmp[year <= 2013 & year >= 1999], c("year", "in_net"), all.x=T)
+panel[, w := totalassets/V1]
+## unweighted
+panel[, .(ratio = mean(equity_ratio, na.rm=T)), c("year", "in_net") ] %>%
+  filter(ratio > 0) %>%
+  filter(year <= 2013 & year > 1998 & year != 2010) %>%
+  ggplot(aes(x = year, y = ratio, col = in_net, group = in_net, shape = in_net)) +
+  geom_line() + geom_point() + scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 2000:2013) +
+  ylab("") + ggtitle("Mean equity ratio") +
+  theme_bw() + 
+  theme(text = element_text(size = 14),
+        legend.position = "bottom",
+        legend.title=element_blank(),
+        legend.margin=margin(t = 0, unit='cm')) +
+  scale_color_hue(labels = c("Out-of-network", "In-network"))+
+  scale_shape_manual(values = c(4, 16),
+                     labels = c("Out-of-network", "In-network"))
+ggsave("../../Tables_Figures/Equity_structure/mean_equity_ratio_in_out_net.pdf",
+       width = 8, height = 4)
+
+fwrite(panel[, .(ratio = mean(equity_ratio, na.rm=T)), c("year", "in_net") ],
+       "../../Tables_Figures/Equity_structure/mean_equity_ratio_in_out_net.csv")
+
+## weighted
+panel[, .(ratio = sum(w*equity_ratio, na.rm=T)), c("year", "in_net") ] %>%
+  filter(ratio > 0) %>%
+  filter(year <= 2013 & year > 1999 & year !=2010) %>%
+  ggplot(aes(x = year, y = ratio, col = in_net, group = in_net, shape = in_net)) +
+  geom_line() + geom_point() + 
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 2000:2013) +
+  ylab("") + ggtitle("Weighted mean equity ratio (by total assets)") +
+  theme_bw() + 
+  theme(text = element_text(size = 14),
+        legend.position = "bottom",
+        legend.title=element_blank(),
+        legend.margin=margin(t = 0, unit='cm')) +
+  scale_color_hue(labels = c("Out-of-network", "In-network"))+
+  scale_shape_manual(values = c(4, 16),
+                     labels = c("Out-of-network", "In-network"))
+ggsave("../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio_in_out_net.pdf",
+       width = 8, height = 4)
+fwrite(panel[, .(ratio = sum(w*equity_ratio, na.rm=T)), c("year", "in_net") ],
+       "../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio_in_out_net.csv")
+ggsave("../../Tables_Figures/Equity_structure/weighted_by_in_net_mean_equity_ratio_in_out_net.pdf",
+       width = 8, height = 4)
+fwrite(panel[, .(ratio = sum(w*equity_ratio, na.rm=T)), c("year", "in_net") ],
+       "../../Tables_Figures/Equity_structure/weighted_by_in_net_mean_equity_ratio_in_out_net.csv")
+
+# SOE
+## weighted
+# panel[, soe := NA]
+# panel[stateownership %in% c(1:5, 9), 
+#       soe := ifelse(stateownership == 1, T, F)]
+panel[, soe := factor(soe)]
+
+tmp <- panel[, sum(as.numeric(totalassets), na.rm=T), c("year", "soe")]
+panel[, V1:=NULL]
+panel <- merge(panel, tmp[year <= 2013 & year >= 1999], c("year", "soe"), all.x=T)
+panel[, w := totalassets/V1]
+
+panel[!is.na(soe), .(ratio = mean(equity_ratio, na.rm=T)), c("year", "soe") ] %>%
+  filter(year <= 2013 & year > 1999 & year !=2010) %>%
+  ggplot(aes(x = year, y = ratio, col = soe, group = soe, shape = soe)) +
+  geom_line() + geom_point() + 
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 2000:2013) +
+  ylab("") + ggtitle("Mean equity ratio") +
+  theme_bw() + 
+  theme(text = element_text(size = 14),
+        legend.position = "bottom",
+        legend.title=element_blank(),
+        legend.margin=margin(t = 0, unit='cm')) +
+  scale_color_manual(values = rev(hue_pal()(2)),
+                     labels = c("non-SOE", "SOE"))+
+  scale_shape_manual(values = c(4, 16),
+                     labels = c("non-SOE", "SOE"))
+ggsave("../../Tables_Figures/Equity_structure/mean_equity_ratio_soe.pdf",
+       width = 8, height = 4)
+dev.off()
+fwrite(panel[!is.na(soe), .(ratio = mean(equity_ratio, na.rm=T)), c("year", "soe") ],
+       "../../Tables_Figures/Equity_structure/mean_equity_ratio_soe.csv")
+
+panel[!is.na(soe) & in_net==0, .(ratio = sum(w*equity_ratio, na.rm=T)), c("year", "soe") ] %>%
+  filter(year <= 2013 & year > 1999 & year !=2010) %>%
+  ggplot(aes(x = year, y = ratio, col = soe, group = soe, shape = soe)) +
+  geom_line() + geom_point() + 
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 2000:2013) +
+  ylab("") + ggtitle("Weighted mean equity ratio (by total assets)") +
+  theme_bw() + 
+  theme(text = element_text(size = 14),
+        legend.position = "bottom",
+        legend.title=element_blank(),
+        legend.margin=margin(t = 0, unit='cm')) +
+  scale_color_manual(values = rev(hue_pal()(2)),
+                     labels = c("non-SOE", "SOE"))+
+  scale_shape_manual(values = c(4, 16),
+                     labels = c("non-SOE", "SOE"))
+ggsave("../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio_soe.pdf",
+       width = 8, height = 4)
+
+fwrite(panel[!is.na(soe), .(ratio = sum(w*equity_ratio, na.rm=T)), c("year", "soe") ],
+       "../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio_soe.csv")
+ggsave("../../Tables_Figures/Equity_structure/weighted_by_soe_mean_equity_ratio_soe.pdf",
+       width = 8, height = 4)
+dev.off()
+fwrite(panel[!is.na(soe), .(ratio = sum(w*equity_ratio, na.rm=T)), c("year", "soe") ],
+       "../../Tables_Figures/Equity_structure/weighted_by_soe_mean_equity_ratio_soe.csv")
+
+tmp <- panel[, sum(as.numeric(totalassets), na.rm=T), c("year", "soe", "in_net")]
+panel[, V1:=NULL]
+panel <- merge(panel, tmp[year <= 2013 & year >= 1999], c("year", "soe", "in_net"), all.x=T)
+panel[, w := totalassets/V1]
+
+panel[!is.na(soe), .(ratio = sum(w*equity_ratio, na.rm=T)), c("year", "soe", "in_net") ] %>%
+  filter(year <= 2013 & year > 1999 & year !=2010) %>%
+  ggplot(aes(x = year, y = ratio, col = soe, group = soe, shape = soe)) +
+  geom_line() + geom_point() + 
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = 2000:2013) +
+  ylab("") + ggtitle("Weighted mean equity ratio (by total assets)") +
+  theme_bw() + 
+  theme(text = element_text(size = 14),
+        legend.position = "bottom",
+        legend.title=element_blank(),
+        legend.margin=margin(t = 0, unit='cm'),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_color_manual(values = rev(hue_pal()(2)),
+                     labels = c("non-SOE", "SOE"))+
+  scale_shape_manual(values = c(4, 16),
+                     labels = c("non-SOE", "SOE")) +
+  facet_wrap(~in_net, labeller = as_labeller(c("TRUE"= "In-network", "FALSE" = "Out-of-network")))
+ggsave("../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio_soe_in_out_net.pdf",
+       width = 8, height = 4)
+fwrite(panel[!is.na(soe), .(ratio = sum(w*equity_ratio, na.rm=T)), c("year", "soe", "in_net") ],
+       "../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio_soe_in_out_net.csv")
+
+## high cent
+degs <- c("indeg", "outdeg", "between", "eigen")
+
+for(deg_ in degs) {
+  panel[, high_deg := get(deg_) > median(get(deg_), na.rm = T), "year"]
+  
+  tmp <- panel[, sum(as.numeric(totalassets), na.rm=T), c("year", "high_deg")]
+  panel[, V1:=NULL]
+  panel <- merge(panel, tmp[year <= 2013 & year >= 1999], c("year", "high_deg"), all.x=T)
+  panel[, w := totalassets/V1]    
+  panel[!is.na(high_deg), 
+        .(ratio = sum(w*equity_ratio, na.rm=T)),
+        c("year", "high_deg") ] %>%
+    filter(year <= 2013 & year >= 1999 & year !=2010) %>%
+    ggplot(aes(x = year, y = ratio, col = high_deg, group = high_deg, shape = high_deg)) +
+    geom_line() + geom_point() + 
+    scale_y_continuous(labels = scales::percent) +
+    scale_x_continuous(breaks = 2000:2013) +
+    ylab("") + ggtitle("Weighted mean equity ratio (by total assets)") +
+    theme_bw() + 
+    theme(text = element_text(size = 14),
+          legend.position = "bottom",
+          legend.title=element_blank(),
+          legend.margin=margin(t = 0, unit='cm')) +
+    scale_color_manual(values = rev(hue_pal()(2)),
+                       labels = paste0(c("Low ", "High "), deg_)) +
+    scale_shape_manual(values = c(4, 16),
+                       labels = paste0(c("Low ", "High "), deg_))
+  ggsave(paste0("../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio_",
+                deg_,".pdf"),
+         width = 8, height = 4)
+  fwrite(panel[!is.na(high_deg), 
+               .(ratio = sum(w*equity_ratio, na.rm=T)),
+               c("year", "high_deg") ],
+         paste0("../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio_",
+                deg_,".csv"))
+  ggsave(paste0("../../Tables_Figures/Equity_structure/weighted_by_high_deg_mean_equity_ratio_",
+                deg_,".pdf"),
+         width = 8, height = 4)
+  fwrite(panel[!is.na(high_deg), 
+               .(ratio = sum(w*equity_ratio, na.rm=T)),
+               c("year", "high_deg") ],
+         paste0("../../Tables_Figures/Equity_structure/weighted_by_high_deg_mean_equity_ratio_",
+                deg_,".csv"))
+}
+
+for(deg_ in degs) {
+  panel[, mean(get(deg_),na.rm=T), c("soe", "year")] %>%
+    ggplot(aes(x = year, y = V1, col = soe, group = soe)) +
+    geom_point() + geom_line() +
+    ylab("") + ggtitle(paste0("Mean ", deg_)) +
+    theme_bw() + 
+    theme(text = element_text(size = 14),
+          legend.position = "bottom",
+          legend.title=element_blank(),
+          legend.margin=margin(t = 0, unit='cm')) +
+    scale_color_manual(values = rev(hue_pal()(2)),
+                       labels = c("non-SOE", "SOE"))+
+    scale_shape_manual(values = c(4, 16),
+                       labels = c("non-SOE", "SOE"))
+  ggsave(paste0("../../Tables_Figures/Equity_structure/soe_", deg_,".pdf"),
+         width = 8, height = 4) 
+}
+
+
+panel[, listed := F]
+panel[!is.na(stkcd), listed := T]
+panel[, .(ratio = sum(w*equity_ratio, na.rm=T)), c("year", "listed") ] %>%
+  filter(year <= 2013 & year > 1999 & year !=2010) %>%
+  ggplot(aes(x = year, y = ratio, col = listed, group = listed, shape = listed)) +
+  geom_line() + geom_point() + 
+  scale_y_continuous(labels = scales::percent) +
+  ylab("") + ggtitle("Weighted mean equity ratio (by total assets)") +
+  theme_bw() + 
+  theme(text = element_text(size = 14),
+        legend.position = "bottom",
+        legend.title=element_blank(),
+        legend.margin=margin(t = 0, unit='cm')) +
+  scale_color_manual(values = rev(hue_pal()(2)),
+                     labels = c("Non-listed", "Listed")) +
+  scale_shape_manual(values = c(4, 16),
+                     labels = c("Non-listed", "Listed"))
+ggsave("../../Tables_Figures/Equity_structure/weighted_mean_equity_ratio_listed.pdf",
+       width = 8, height = 4)
+
+```
+
+
+## Low rank
+```{r}
+pacman::p_load(sparsesvd, irlba, grDevices, s4vd, PMA)
+
+g <- readRDS("output/g_2012_no_dangling_cent.RDS")
+g <- extract_cc(g, 1)
+nodes <- as_data_frame(g, "vertices")
+setDT(nodes)
+nodes[name == "4244138"]
+mat <- as_adjacency_matrix(g)
+
+# spca
+s_full <- sparsesvd(mat)
+
+k=10
+s <- rsvd(mat, k=k)
+mhat <- s$u %*% diag(s$d) %*% t(s$v) # matrix approximation
+
+
+print(100 * norm( mat - mhat, 'F') / norm( mat,'F')) 
+
+
+# irlba
+k <- 10
+svd_mat <- irlba(mat, nv = k)
+plot(1:k, svd_mat$d)
+# svd_mat <- svd(mat)
+# 
+# N <- nrow(mat)
+# splits <- 100
+# num_sub <- ceiling(N/splits)
+# max_k <- ncol(svd_mat$u)
+# err <- rep(0,max_k)
+# 
+# for(kk in 2:max_k) {
+#   for(s in 1:splits)
+#   {
+#     if(s == splits) {
+#       cols <- (1+(s-1)*num_sub):N
+#     } else {
+#       cols <- 1:ceiling(N/splits) + (s-1)*num_sub 
+#     }
+#     m_sub <- svd_mat$u[cols,1:kk] %*% diag(svd_mat$d[1:kk]) %*% t(svd_mat$v[,1:kk])
+#     err[kk] <- err[kk] + norm(m_sub - mat[cols,], 'F')
+#   }  
+# }
+# 
+# for(kk in 2:max_k) {
+#   
+#     m_sub <- svd_mat$u[,1:kk] %*% diag(svd_mat$d[1:kk]) %*% t(svd_mat$v[,1:kk])
+#     err[kk] <- err[kk] + norm(m_sub - mat, 'F')
+#     
+# }
+# 
+# plot(1:max_k, err)
+
+max_k <- 3
+idx <- sample(1:nrow(mat), 100000)
+uorder <- order(svd_mat$u[, 3], decreasing = T)
+idx <- floor(seq(1, nrow(mat), length.out = 500000))
+
+# random
+image(mat[idx, idx])
+
+# order by u1
+image(mat[uorder[idx], uorder[idx]])
+
+idx <- seq(1, nrow(mat), length.out = 500000)
+fig <- NULL
+for(i in 1:max_k){
+  uorder <- order(svd_mat$u[,i], decreasing = T)
+  fig[[i]] <- image(t(apply(mat[uorder[idx], uorder[idx]],2,rev)))
+}
+png("output/tables_figures/svd_3.png", width = 1600, height = 1200)
+grid.arrange(grobs = fig, nrow = 1)
+dev.off()
+
+idx <- seq(1, nrow(mat), length.out = 10000)
+mat_hat <- svd_mat$u[idx,1:max_k] %*% diag(svd_mat$d[1:max_k]) %*% t(svd_mat$v[idx, 1:max_k])
+uorder <- order(svd_mat$u[idx, 1], decreasing = T)
+image(mat_hat[uorder,uorder])
+
+indus_order <- order(nodes[, indus])
+image(mat[uorder[idx], indus_order[idx]],
+      scales=list(x=list(at=table(nodes$indus[idx]),
+                         labels=rownames(table(nodes$indus[idx])),
+                         rot=90)))
+
+
+
+nodes[, prov:=substr(cntycode,1,2)]
+prov_order <- order(nodes[, prov])
+image(mat[uorder[idx], prov_order[idx]],
+      scales=list(x=list(at=table(nodes$prov[idx]),
+                         labels=rownames(table(nodes$prov[idx])),
+                         rot=90)))
+
+# degorder
+degorder <- order(degree(g, mode="out"), decreasing = T)
+image(mat[degorder[idx], degorder[idx]])
+
+mat_ <- mat[degorder[idx], degorder[idx]]
+sum(mat_[2, ])
+
+image(diag(1:10, nrow = 10))
+
+
+# embed
+# cols <- unique(gsub("[0-9]+", "", colors()))[seq(2, 142, 6)]
+cols <- c("white", "white", grDevices::rainbow(24))
+palette(cols)
+mat3 <- embed_adjacency_matrix(g, 4, weights = log(E(g)$weight))
+plot(mat3$X[,1], mat3$X[,2], col = as.factor(nodes[, indus]))
+plot(mat3$Y[,1], mat3$Y[,2], col = as.factor(nodes[, indus]))
+theta <- cbind(atan((mat3$X[,2]) / (mat3$X[,1])), atan((mat3$Y[,2]) / (mat3$Y[,1])))
+par(mar=c(5.1, 4.1, 4.1, 10.1), xpd=TRUE, bg = "white")
+plot(theta, col = as.factor(nodes[, indus]), pch = 16, cex = 2)
+legend("topright", inset = c(-.7, 0), 
+       legend = levels(factor(nodes$indus)), 
+       col = cols, pch = 16, cex = .75, bty='n', pt.cex = 1, y.intersp=.5)
+
+lap_mat <- embed_laplacian_matrix(g, 4, which = "sa", type = "OAP")
+lap_mat$X
+
+
+mat_s <- irlba::ssvd(mat, k = 4, n = 10000)
+sapply(1:4, function(x) sum(mat_s$u[, x]!=0))
+sapply(1:4, function(x) sum(mat_s$v[, x]!=0))
+
+View(nodes[mat_s$u[,1] != 0, ][order(-eigen_c)])
+
+diffu2 <- data.table(name = setdiff(nodes[mat_s$u[,2] != 0, name], nodes[mat_s$u[,1] != 0, name]))
+View(merge(nodes, diffu2, by = "name")[order(-eigen_c)])
+
+diffu3 <- data.table(name = setdiff(nodes[mat_s$u[,3] != 0, name], nodes[mat_s$u[,2] != 0, name]))
+View(merge(nodes, diffu3, by = "name")[order(-eigen_c)])
+
+
+View(nodes[mat_s$v[,1] != 0, ][order(-eigen_c)])
+intersect(nodes[mat_s$v[,1] != 0, name], nodes[mat_s$v[,2] != 0, name])
+diffv2 <- data.table(name = setdiff(nodes[mat_s$v[,2] != 0, name], nodes[mat_s$v[,1] != 0, name]))
+View(merge(nodes, diffv2, by = "name")[order(-eigen_c)])
+
+diffv3 <- data.table(name = setdiff(nodes[mat_s$v[,3] != 0, name], nodes[mat_s$v[,2] != 0, name]))
+View(merge(nodes, diffv3, by = "name")[order(-eigen_c)])
+
+```
+
+
+
+### Star graph simulation
+```{r}
+# star gragh
+s1 <- 5
+s2 <- 10
+s3 <- 10
+
+b1 <- 10
+b2 <- 15
+b3 <- 15
+g_star <- make_star(s1, mode = "out") %du% 
+  make_star(s2, mode = "out") %du% 
+  make_star(s3, mode = "out") %>%
+  add_edges(c(1,s1+1, s1+1, s1+s2+1, s1+s2+1, 1))
+add_vertices(1) %>%
+  add_edges(c(1,s1+1, s1+1, s1+s2+1, s1+s2+1, 1, 
+              s1+s2+s3+1, 1, s1+s2+s3+1, s1+1, s1+s2+s3+1, s1+s2+1))
+plot(g_star, layout=layout_with_fr, 
+     vertex.size = 10, edge.arrow.size = .5,
+     vertex.dist = 15)
+
+g_star <-  make_star(s1, mode = "in") %>% 
+  add_vertices(2) %>% 
+  add_edges(c(1, 6, 7, 2, 1, 7, 6, 2))
+plot(g_star, layout=layout_with_fr, 
+     vertex.size = 10, edge.arrow.size = .5,
+     vertex.dist = 15)
+
+eigen_centrality(g_star, directed = T)$vector
+
+# tree/star + block model
+g_star <- make_star(s1, mode = "undirected") %du% 
+  make_star(s2, mode = "undirected") %du% 
+  make_star(s3, mode = "undirected") %du% 
+  sample_(sbm(n = b1+b2+b3,
+              pref.matrix = diag(0.3, 3) + 0.1,
+              block.sizes = c(b1, b2, b3))) %>%
+  add_edges(c(1,26, 1, 28, 1, 30, 1, 34, 6, 28, 6, 26, 6, 30, 6, 34,
+              16, 36, 16, 38, 16, 40, 16, 43, 16, 45))
+plot(g_star, layout=layout_with_fr, 
+     vertex.size = 10, edge.arrow.size = .5,
+     vertex.dist = 15, 
+     vertex.color = c(rep("red", s1), rep("orange", s2), rep("green", s3), 
+                      rep("yellow", b1), rep("blue", b2), rep("purple", b3)))
+
+g_star = sample_(sbm(n = b1+b2+b3,
+                     pref.matrix = diag(0.3, 3) + 0.1,
+                     block.sizes = c(b1, b2, b3)))
+
+b1 <- 100
+b2 <- 150
+b3 <- 150
+B <- diag(0.3, 3) + 0.1
+B[1,1] <- 0.1
+B[1,2] <- 0.6
+B[2,1] <- .6
+g_star = sample_(sbm(n = b1+b2+b3,
+                     pref.matrix = B,
+                     block.sizes = c(b1, b2, b3)))
+
+
+star_svd <- irlba::svdr(g_star[], k = 10)
+plot(1:10, star_svd$d)
+
+star_svd <- embed_adjacency_matrix(g_star, 5, scaled = T)
+plot(1:5, star_svd$D)
+cols <- c(rep("red", s1), rep("blue", s2), rep("green", s3), "orange")
+shapes <- c(17, rep(16, s1-1), 17, rep(16, s2-1), 17, rep(16, s3-1), 8)
+plot(star_svd$X[,1], star_svd$X[,2], col = cols, pch = shapes)
+plot(star_svd$X[,1], star_svd$X[,3], col = cols, pch = shapes)
+plot(star_svd$X[,2], star_svd$X[,3], col = cols, pch = shapes)
+plot(star_svd$Y[,1], star_svd$Y[,2], col = cols, pch = shapes)
+theta <- cbind(atan((star_svd$X[,2]) / (star_svd$X[,1])), 
+               atan((star_svd$Y[,2]) / (star_svd$Y[,1])))
+plot(theta, cex = 1, col = cols, pch = shapes)
+
+
+star_svd_s <- irlba::ssvd(g_star[], k = 4, n = 100)
+plot(1:3, diag(star_svd_s$d))
+cols <- c(rep("red", s1), rep("blue", s2), rep("green", s3), "orange")
+shapes <- c(17, rep(16, s1-1), 17, rep(16, s2-1), 17, rep(16, s3-1), 8)
+
+image(g_star[], main = "Original Adj mat")
+par(mfrow=c(1,4))
+imgs <- NULL
+for(kk in 1:4) {
+  imgs[[kk]] <- image(Matrix(outer(star_svd_s$v[,kk], 
+                                   star_svd_s$v[,kk], "*") * diag(star_svd_s$d)[kk], 
+                             sparse = T), 
+                      main = paste0("s", kk, "*u", kk, "*v", kk))
+}
+
+grid.arrange(imgs[[1]], imgs[[2]], imgs[[3]],imgs[[4]], nrow = 1)
+
+plot(star_svd_s$u[,1], star_svd_s$u[,2], col = cols, pch = shapes)
+plot(star_svd_s$u[,1], star_svd_s$u[,3], col = cols, pch = shapes)
+plot(star_svd_s$u[,2], star_svd_s$u[,3], col = cols, pch = shapes)
+plot(star_svd_s$v[,1], star_svd_s$v[,2], col = cols, pch = shapes)
+theta <- cbind(atan((star_svd_s$u[,2]) / (star_svd_s$u[,1])), 
+               atan((star_svd_s$Y[,2]) / (star_svd_s$Y[,1])))
+plot(theta, cex = 1, col = cols, pch = shapes)
+
+# k-mean spectral clustering 
+km_m <- kmeans(t(diag(diag(star_svd_s$d)) %*% t(star_svd_s$v)), centers = 3)
+cols <- c("red", "blue", "green")
+plot(g_star, vertex.color=cols[km_m$cluster])
+
+out <- PMD(as.matrix(g_star[]), type="standard", K=3, sumabsu=3, sumabsv=5)
+print(out)
+out$u
+out$v
+
+laplacian_matrix(g_star)
+
+m1 <- cluster_fast_greedy(g_star)
+plot(m1, g_star)
+
+m1 <- cluster_leading_eigen(g_star)
+plot(m1, g_star)
+
+D <- diag(degree(g_star))
+L <- sqrt(D) %*% g_star[] %*% sqrt(D) + D
+```
+
+```{r}
+# star gragh
+s1 <- 2
+s2 <- 5
+s3 <- 2
+
+g_star <- make_star(s1, mode = "out") %du% 
+  make_star(s2, mode = "out") %du% 
+  make_star(s3, mode = "out") %>%
+  add_edges(c(1,s1+1, 1, s1+s2+1, 1, 4))
+
+fr <- layout.fruchterman.reingold(g_star)
+
+png("output/tables_figures/original.png", width = 800, height = 500)
+plot(g_star, layout=fr, 
+     vertex.size = 20, 
+     edge.arrow.size = 1.5,
+     edge.width = 5,
+     vertex.color = "white", 
+     vertex.dist = 15, 
+     vertex.label.color = "black",
+     vertex.label.font=2,         
+     vertex.label.cex=2,
+     edge.color = "black")
+dev.off()
+
+hub <- hub_score(g_star)$vector
+aut <- authority_score(g_star)$vector
+
+png("output/tables_figures/hub.png", width = 500, height = 500)
+plot(g_star, layout=fr, 
+     vertex.size = log(hub+1.4)*30, 
+     edge.arrow.size = 1.5,
+     edge.width = 5,
+     vertex.color = "white", 
+     vertex.dist = 15, 
+     vertex.label.color = "black",
+     vertex.label.font=2,         
+     vertex.label.cex=2,
+     edge.color = "black")
+dev.off()
+
+png("output/tables_figures/authority.png", width = 500, height = 500)
+plot(g_star, layout=fr, 
+     vertex.size = log(aut+1.3)*30, 
+     edge.arrow.size = 1.5,
+     edge.width = 5,
+     vertex.color = "white", 
+     vertex.dist = 15, 
+     vertex.label.color = "black",
+     vertex.label.font=2,         
+     vertex.label.cex=2,
+     edge.color = "black")
+dev.off()
+
+```
+
+# Panel
+```{r}
+years <- seq(1999, 2017)
+pan <- vector("list", length(years))
+
+for (i in years) {
+  v <- fread(paste0("../dynamic_networks/holding_networks_", i, ".csv"),
+             header = T, encoding = "UTF-8", stringsAsFactors = F)
+  v$year <- i
+  pan[[i]] <- v
+}
+pan <- rbindlist(pan)
+```
+
+## cross holding
+```{r}
+ret <- NULL
+for(i in years) {
+  print(i)
+  pan[[i]][, new_entid_investor := as.character(new_entid_investor)]
+  pan[[i]][, new_entid_invested := as.character(new_entid_invested)]
+  pan[[i]] <- pan[[i]][!is.na(new_entid_invested) & 
+                         !is.na(new_entid_investor) & 
+                         new_entid_invested!=new_entid_investor,]
+  pan[[i]] <- unique(pan[[i]])
+  nodes <- rbind(pan[[i]][, .(new_entid = new_entid_investor, 
+                              reg_cap = reg_cap_investor)],
+                 pan[[i]][, .(new_entid = new_entid_invested, 
+                              reg_cap = reg_cap_invested)])
+  nodes <- unique(nodes)
+  
+  network_tmp <- merge(pan[[i]], pan[[i]], 
+                       by.x = "new_entid_invested",
+                       by.y = "new_entid_investor")
+  
+  cross_hold <- network_tmp[new_entid_investor == new_entid_invested.y,]
+  ch_nodes <- rbind(cross_hold[, .(new_entid = new_entid_investor, 
+                                   reg_cap = reg_cap_investor.x,
+                                   cash = cash.x)], 
+                    cross_hold[, .(new_entid = new_entid_invested, 
+                                   reg_cap = reg_cap_invested.x,
+                                   cash = cash.y)])
+  ch_nodes <- unique(ch_nodes)
+  
+  total_cash <- sum(pan[[i]]$cash, na.rm=T)
+  ch_cash <- sum(ch_nodes$cash, na.rm=T)
+  
+  total_reg_cap <- sum(nodes$reg_cap, na.rm = T)
+  ch_reg_cap <- sum(ch_nodes$reg_cap, na.rm = T)
+  
+  ret <- rbind(ret, 
+               data.table(n_firm = nrow(nodes), n_ch_firm = nrow(ch_nodes),
+                          total_reg_cap = total_reg_cap, ch_reg_cap = ch_reg_cap,
+                          n_inv = nrow(pan[[i]]), n_ch_inv = nrow(cross_hold),
+                          total_cash = total_cash, ch_cash = ch_cash))
+}
+ret[, year := years]
+
+# fwrite(ret, "output/cross_holding.csv")
+# fwrite(ret, "../../Tables_Figures/Equity_structure/cross_holding.csv")
+p1 <- print(ret %>%
+              ggplot(aes(x=year, y=n_ch_firm)) + 
+              # scale_y_continuous(labels = scales::percent) +
+              geom_line() + geom_point() + 
+              ylab("") + 
+              # ggtitle("Cross-holding firms") +
+              theme_bw() + 
+              theme(text = element_text(size = 14),
+                    legend.position="bottom", 
+                    legend.key.width = unit(2.5,"line"))
+)
+p2 <- print(ret[, ratio:=n_ch_firm/n_firm] %>%
+              ggplot(aes(x=year, y=ratio)) + 
+              scale_y_continuous(labels = scales::percent) +
+              geom_line() + geom_point() + 
+              ylab("") + 
+              # ggtitle("Cross-holding firms") +
+              theme_bw() + 
+              theme(text = element_text(size = 14),
+                    legend.position="bottom", 
+                    legend.key.width = unit(2.5,"line"))
+)
+
+p <- ggarrange(p1, p2, nrow = 1)
+annotate_figure(p,
+                top = text_grob("Cross-holding firms", size =14))
+
+ggsave("../../Tables_Figures/Equity_structure/cross_hold_firms.pdf",
+       width = 8, height = 4)
+
+p1 <- print(ret %>%
+              ggplot(aes(x=year, y=ch_reg_cap)) + 
+              # scale_y_continuous(labels = scales::percent) +
+              geom_line() + geom_point() + 
+              ylab("") + 
+              # ggtitle("Cross-holding firms") +
+              theme_bw() + 
+              theme(text = element_text(size = 14),
+                    legend.position="bottom", 
+                    legend.key.width = unit(2.5,"line"))
+)
+p2 <- print(ret[, ratio:=ch_reg_cap/total_reg_cap] %>%
+              ggplot(aes(x=year, y=ratio)) + 
+              scale_y_continuous(labels = scales::percent) +
+              geom_line() + geom_point() + 
+              ylab("") + 
+              # ggtitle("Cross-holding firms") +
+              theme_bw() + 
+              theme(text = element_text(size = 14),
+                    legend.position="bottom", 
+                    legend.key.width = unit(2.5,"line"))
+)
+
+p <- ggarrange(p1, p2, nrow = 1)
+annotate_figure(p,
+                top = text_grob("Cross-holding firms", size =14))
+
+ggsave("../../Tables_Figures/Equity_structure/cross_hold_firms_reg_cap.pdf",
+       width = 8, height = 4)
+
+p1 <- print(ret %>%
+              ggplot(aes(x=year, y=n_ch_inv)) + 
+              # scale_y_continuous(labels = scales::percent) +
+              geom_line() + geom_point() + 
+              ylab("") + 
+              # ggtitle("Cross-holding firms") +
+              theme_bw() + 
+              theme(text = element_text(size = 14),
+                    legend.position="bottom", 
+                    legend.key.width = unit(2.5,"line"))
+)
+p2 <- print(ret[, ratio:=n_ch_inv/n_inv] %>%
+              ggplot(aes(x=year, y=ratio)) + 
+              scale_y_continuous(labels = scales::percent) +
+              geom_line() + geom_point() + 
+              ylab("") + 
+              # ggtitle("Cross-holding firms") +
+              theme_bw() + 
+              theme(text = element_text(size = 14),
+                    legend.position="bottom", 
+                    legend.key.width = unit(2.5,"line"))
+)
+
+p <- ggarrange(p1, p2, nrow = 1)
+annotate_figure(p,
+                top = text_grob("Cross-holding investment", size =14))
+
+ggsave("../../Tables_Figures/Equity_structure/cross_hold_inv.pdf",
+       width = 8, height = 4)
+
+p1 <- print(ret %>%
+              ggplot(aes(x=year, y=ch_cash)) + 
+              # scale_y_continuous(labels = scales::percent) +
+              geom_line() + geom_point() + 
+              ylab("") + 
+              # ggtitle("Cross-holding firms") +
+              theme_bw() + 
+              theme(text = element_text(size = 14),
+                    legend.position="bottom", 
+                    legend.key.width = unit(2.5,"line"))
+)
+p2 <- print(ret[, ratio:=ch_cash/total_cash] %>%
+              ggplot(aes(x=year, y=ratio)) + 
+              scale_y_continuous(labels = scales::percent) +
+              geom_line() + geom_point() + 
+              ylab("") + 
+              # ggtitle("Cross-holding firms") +
+              theme_bw() + 
+              theme(text = element_text(size = 14),
+                    legend.position="bottom", 
+                    legend.key.width = unit(2.5,"line"))
+)
+
+p <- ggarrange(p1, p2, nrow = 1)
+annotate_figure(p,
+                top = text_grob("Cross-holding investment amount (10k)", size =14))
+
+ggsave("../../Tables_Figures/Equity_structure/cross_hold_inv_amount.pdf",
+       width = 8, height = 4)
+```
+
+
+## Centrality
+```{r}
+years <- 1999:2013
+cent_ret <- NULL
+for(i in years) {
+  tmp <- fread(paste0("../centrality/centrality_20200309/centrality/centralities_", i, ".csv"))
+  cent_ret <- rbind(cent_ret, tmp[4,])
+}
+
+setDT(cent_ret)
+cent_ret[, deg:= indeg + outdeg]
+cols <- c("indeg", "outdeg", "deg", "btw","eigen_undir", "hub", "authority", "page_rank_rev")
+cent_ret <- cent_ret[, ..cols]
+cent_ret[, year:=years]
+setnames(cent_ret, old = cols, 
+         new = c("Indegree", "Outdegree", "Degree", "Betweeness", "Eigenvector",
+                 "Hub", "Authority", "PageRank"))
+fwrite(cent_ret, "../../Tables_Figures/Centrality/centralities_20200309.csv")
+
+cent_ret_long <- melt(cent_ret, id.vars = c( "year"))
+cent_ret_long %>%
+  ggplot(aes(x=year, y=value, col=variable, group = variable)) + 
+  # scale_y_continuous(labels = scales::percent) +
+  geom_line() + geom_point() + 
+  ylab("") + 
+  # ggtitle("Cross-holding firms") +
+  theme_bw() + 
+  theme(text = element_text(size = 14),
+        legend.position="none", 
+        legend.key.width = unit(2.5,"line")) +
+  facet_wrap(~variable, scales = "free", ncol= 4) +
+  xlab("") +
+  ggtitle(
+    "Mean of centralities"
+  )
+
+ggsave("../../Tables_Figures/Centrality/centralities_20200309.pdf", width=9, height=6)
+```

@@ -1,0 +1,972 @@
+---
+title: "Chinese economy network analysis"
+output:
+ pdf_document:
+   toc: yes
+   latex_engine: "xelatex"
+   extra_dependencies:
+     ctexcap: UTF8
+
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, cache=T)
+pacman::p_load(ggplot2, data.table, stringr, dplyr, tidyr, 
+               glmnet, xtable, doParallel, scales, plm, lfe, lme4, igraph)
+
+if(.Platform$OS.type=="windows") {
+  setwd("C:/Users/junhui/Dropbox (Penn)/Linda_Wu Zhu/Data & Codes")
+}
+
+if(.Platform$OS.type=="unix") {
+  setwd("~/Dropbox (Penn)/Linda_Wu Zhu/Data & Codes")
+}
+
+source("../../AllData/AIS/R/heatmap.R")
+
+if(.Platform$OS.type=="windows") {
+  setwd("C:/Users/junhui/Dropbox (Penn)/Linda_Wu Zhu/Data & Codes")
+  Sys.setlocale(category = "LC_CTYPE", locale = "chs")
+}
+
+source("misc/utilities.R")
+# qwraps2::lazyload_cache_dir("chinese_econ_network_analysis_cache/latex/")
+```
+
+# Introduction
+This report is organized as follows. We first overview the data, then we define some centrality measurements and analyze the distribution of the centrality of our network. We further look into the firms with high centrality.  
+
+# Data Overview
+## Firm Registration Data
+The Firm Registration Database, originated from the China’s State Administration for Industry and Commerce (SAIC), includes registration date, registered capital, industry, ownership type, status of the firm (either existing or bankrupt), and location information of each firm as of 2017.   Firms can be traced back to as early as 1950 and the number of registered firms is up to 90 million.
+
+
+## Equity Ownership Record
+Meanwhile, SAIC also provides detailed information on shareholders and ownership structure in terms of equity investments of all the registered firms. Records of shareholder update and shareholder’s equity investment update since 1950 are also provided. Each update records the time of the update, all the shareholders, and their corresponding nature of legal person (natural person/individual or institutional), investment amount, share of the invested firm before and after the update. The investment amount and the share information are based on the most updated registered capital in the Firm Registration Database. 
+
+
+# Equity Ownership Network 
+To understand how capital flows among different investors and investees, we construct an equity ownership network of all the registered companies within Chinese economy.   In general, a network is defined by a set of nodes that are connected through edges. In our setting, nodes represent firms (either investors or investees) and edges represent equity investments, which can further be weighted to measure the strengths of the connections. In graph theory, a network can be represented by a square “adjacency” matrix, the cells of which reflect the ties among the nodes in the network. Our equity ownership network is directed, meaning that the matrix is asymmetric.  Therefore, the matrix, denoted $A$, where the entry $A_{ij}$ for row $i$ and column $j$ indicates the equity investment from investing firm (investor) $i$ to invested firm (investee) $j$. 
+
+Firms or institutions that have institutional shareholders, which accounts for more than 80% of the total registered capital (???), are the focus of our analysis. By excluding firms that are only invested by individual shareholders based on the Equity Ownership Record, we end up with 5.4 million registered firms. Based on this, we construct the dynamic equity ownership network across years by tracing back the shareholder and equity investment updates in the Equity Ownership Record for each firm in the Firm Registration Data. More specifically, for each firm, we build up connections (edges) between the firm and its shareholders for each update and fill in the years using the corresponding latest updates.
+
+The dynamic equity ownership network includes 5.34 million firms or institutions. We term these firms as in-network firms, meaning that they are either investors or investees (or both). The out-of-network firms, on the other hand, are neither investors nor investees.
+
+Using the dynamic network, we are able to investigate the equity ownership changes and the investment flows across regions and industries.
+
+
+# 2017 Network
+```{r load, include=F}
+network_2017 <- fread("../dynamic_networks_old/holding_networks_2017_WT.csv", 
+                      header = TRUE, fill=T, encoding="UTF-8", stringsAsFactors=FALSE)
+basic_info <- fread("Data/basic_info_v2_WT.csv", header = TRUE, encoding="UTF-8", stringsAsFactors=FALSE)
+basic_info <- basic_info %>% rename(name = "公司名")
+# fix a minor bug
+basic_info[which.max(basic_info$reg_capital)]$reg_capital <- NA
+```
+
+```{r basic info stats}
+n_firms <- basic_info[,.N]
+n_miss_regcap <- basic_info[is.na(reg_capital),.N]
+```
+There are `r n_miss_regcap` (`r percent(n_miss_regcap/n_firms)`) have missing registered capital.
+
+```{r results='asis', comment=F, echo=F}
+xtable(print(table(basic_info[`登记状态` %in% c("存续","注销","吊销","撤销","迁出","迁入","None","在业","正常"), `登记状态`])),
+       include.colnames=F)
+```
+
++ Fill in share==0 using percentage
++ 
+```{r network 2017 stats}
+network_2017[share==0&!is.na(cash)&!is.na(reg_cap_invested), share:=cash/reg_cap_invested*100]
+n_miss_share <- sum(is.na(network_2017$share))
+n_miss_cash <- sum(is.na(network_2017$cash))
+n_network_2017 <- nrow(network_2017)
+```
+Note `r n_miss_share` (`r percent(n_miss_share/n_network_2017)`) of the edges have missing share and `r n_miss_cash` (`r percent(n_miss_cash/n_network_2017)`) have missing cash investment.
+
+
+```{r build net}
+# edges and nodes
+edges <- network_2017[,.(from=new_entid_investor, to=new_entid_invested, weight=share, cash=cash)]
+# nodes <- data6[,.(name=new_entid, type, firmname=name, reg_capital, ownership)]
+nodes <- c(edges$from, edges$to)
+nodes <- data.table(entid=unique(nodes))
+nodes <- merge(nodes, basic_info[,.(name=new_entid, indus, firmname=name, reg_capital, ownership)],
+               by.x = "entid", by.y = "name", all.x=T, all.y=F)
+nodes <- nodes[!duplicated(entid),]
+
+# mg <- merge(network_2017, basic_info, by.x="new_entid_invested", by.y="new_entid", all.x=T)
+# tmp = unique(network_2017[,.(reg_cap_invested, sum_cash=sum(cash), sum_share=sum(share)), by=new_entid_invested])
+# network_2017[, `:=`(sum_cash=sum(cash), sum_share=sum(share)), by=new_entid_invested]
+
+# build graph
+
+g <- graph_from_data_frame(edges, T, nodes)
+```
+
+## EDA
+### Status
+Should we include exited firms?
+
+
+## Structual Plots
+We ramdonly picked 1000k samples and plot the adjacency matrix by industry and ownership.
+
+```{r adj mat random, message=FALSE, warning=FALSE, eval=F}
+plot_adj_mat_by <- function(g, by, labels=F, nsample=1000000,
+                            width=2046, height=2046, filename) {
+  nodes <- V(g)
+  sample_idx <- sample(1:length(nodes), nsample)
+  index_table <- data.frame(rndid=1:nsample, name=nodes$name[sample_idx])
+  g_sub <- induced_subgraph(g, nodes[sample_idx])
+  g_sub_nodes <- get.data.frame(g_sub, "vertices")
+  g_sub_edges <- get.data.frame(g_sub, "edges")
+  g_sub_nodes <- merge(g_sub_nodes, index_table, by="name")
+  g_sub_nodes <- g_sub_nodes[order(g_sub_nodes[,by], g_sub_nodes$rndid),]
+  g_sub_by <- graph_from_data_frame(g_sub_edges, T, g_sub_nodes)
+  g_sub_adj <- as_adjacency_matrix(g_sub_by)
+  
+  png(paste("../Tables_Figures/Adjacency_Matrix/",filename,".png", sep=""), width=width, height=height)
+  image(g_sub_adj, 
+        scales=list(y=list(at=table(V(g_sub_by)$by),
+                           labels=rownames(table(V(g_sub_by)$by))),
+                    x=list(at=table(V(g_sub_by)$by),
+                           labels=rownames(table(V(g_sub_by)$by)),
+                           rot=90)),
+        main=paste("2017 Adjacency Matrix of 1000k samples ", filename, sep=""))
+  dev.off()
+}
+
+
+```
+
+### Adjacency matrix by Ownership
+We see assymetric and block structures by ownership. The off-diagonal strips could be due to the spectrum effects (Kleinberg refered to a recent paper with his students claiming the the spectrum effects). The possible explanation we came up with is that the indices of firms is assigned after sorted by firm names and firm names does indicate the investment structure especially for subsidairies and branches. Further exploration is needed.
+
+```{r, echo=FALSE, fig.cap="", out.width = '100%'}
+knitr::include_graphics("../Tables_Figures/Adjacency_Matrix/2017_by_ownership_name.png")
+```
+
+If we permute firms within one category (ownership type).
+
+```{r, echo=FALSE, fig.cap="", out.width = '100%'}
+knitr::include_graphics("../Tables_Figures/Adjacency_Matrix/2017_by_ownership.png")
+```
+
+```{r adj mat ownership, message=FALSE, warning=FALSE, eval=F}
+sample_idx <- sample(1:nrow(nodes), 1000000)
+g_sub <- induced_subgraph(g, V(g)[sample_idx])
+g_sub_nodes <- get.data.frame(g_sub, "vertices")
+g_sub_edges <- get.data.frame(g_sub, "edges")
+g_sub_nodes <- g_sub_nodes[order(g_sub_nodes$ownership),]
+g_sub_ownership <- graph_from_data_frame(g_sub_edges, T, g_sub_nodes)
+g_sub_adj <- as_adjacency_matrix(g_sub_ownership)
+
+image(g_sub_adj, 
+      scales=list(y=list(at=table(V(g_sub_ownership)$ownership),
+                         labels=rownames(table(V(g_sub_ownership)$ownership))),
+                  x=list(at=table(V(g_sub_ownership)$ownership),
+                         labels=rownames(table(V(g_sub_ownership)$ownership)),
+                         rot=90)),
+      main="2017 Adjacency Matrix of 1000k samples by ownership")
+
+```
+
+### Adjacency matrix by Industry
+```{r, echo=FALSE, fig.cap="", out.width = '100%'}
+knitr::include_graphics("../Tables_Figures/Adjacency_Matrix/2017_by_indus_name.png")
+```
+
+```{r adj mat indus, message=FALSE, warning=FALSE, eval=F}
+sample_idx <- sample(1:nrow(nodes), 1000000)
+g_sub <- induced_subgraph(g, V(g)[sample_idx])
+g_sub_nodes <- get.data.frame(g_sub, "vertices")
+g_sub_edges <- get.data.frame(g_sub, "edges")
+g_sub_nodes <- g_sub_nodes[order(g_sub_nodes$indus),]
+g_sub_indus <- graph_from_data_frame(g_sub_edges, T, g_sub_nodes)
+g_sub_adj <- as_adjacency_matrix(g_sub_indus)
+image(g_sub_adj, 
+      scales=list(y=list(at=table(V(g_sub_indus)$indus),
+                         labels=rownames(table(V(g_sub_indus)$indus)) )),
+      main="2017 Adjacency Matrix of 1000k samples by industry")
+```
+
+
+## Centrality
+
+### In-degree and out-degree
+
+The degree of a node is defined as the total number of edges incident on the node, regardless of their directions. In-degree is defined as the total number of edges pointing towards a node, and out-degree is defined as the total number of edges pointing out from a node. In our context, we interpret the in-degree of a node, i.e. a firm, as the number of investors it has. Similarly, the out-degree of a node, i.e. a firm, represents the number of investments it makes. Note that neither in-degree nor out-degree takes into account the number of shares an investor holds in a company. 
+
+
+```{r in out degree cal}
+nodes_2017 <- get.data.frame(g, "vertices")
+nodes_2017 <- setDT(nodes_2017)
+
+outdeg <- degree(g, mode="out")
+indeg <- degree(g, mode="in")
+alldeg <- degree(g, mode="all")
+
+# fill in the centrality measurement
+nodes_2017$indeg <- indeg
+nodes_2017$outdeg <- outdeg
+
+n_2017 <- nrow(nodes_2017)
+n_deg1 <- sum(alldeg==1)
+n_indeg0 <- sum(indeg==0)
+n_outdeg0 <- sum(outdeg==0)
+n_indeg1 <- sum(indeg==1)
+n_in1_out1 <- nodes_2017[indeg==1 & outdeg==1,.N]
+```
+
+The histograms below display the distribution of degree, in-degree and out-degree of the Chinese equity holding network. The distributions are all right-skewed.
+
+1. `r n_deg1` (`r percent(n_deg1/n_2017)`) of the firms have total degree of 1
+
+2.  `r n_outdeg0` (`r percent(n_outdeg0/n_2017)`) of the firms have out-deg of 0 indicating that they are the leaves of the graph
+
+3.  `r n_indeg0` (`r percent(n_indeg0/n_2017)`) of the firms have in-deg of 0 indicating that they are the roots and `r n_indeg1` (`r percent(n_indeg1/n_2017)`) of the firms have in-deg of 1
+
+4. `r n_in1_out1` (`r percent(n_in1_out1/n_2017)`) of the firms have exactly 1 investor and 1 investee, which serves as a bridge
+
+
+
+```{r deg plot}
+plot_discrete_range(alldeg, name="degree", range=c(NA, 10))
+plot_discrete_range(outdeg, name="out-degree", range=c(NA, 10))
+plot_discrete_range(indeg, name="in-degree", range=c(NA, 10))
+```
+
+Here is the list of firms with top10 in-degree, which are the popular investees. 
+
+```{r top in deg, echo=F, results='asis'}
+xtable(print(nodes_2017[order(indeg,decreasing = T),.(firmname, indus, ownership, reg_capital, indeg)][1:10]),include.rownames=F)
+```
+
+
+Here is the list of firms with top10 out-degree, which are the active investors.
+
+```{r top out deg, echo=F, results='asis'}
+xtable(print(nodes_2017[!is.na(firmname)][order(outdeg,decreasing = T),.(firmname, ownership, reg_capital, outdeg)][1:10]),include.rownames=F)
+```
+
+#### Summary by group 
+```{r}
+nodes_2017[, .(median_indeg = median(indeg, na.rm=T),
+               mean_indeg = mean(indeg, na.rm=T),
+               max_indeg = max(indeg, na.rm=T)), by=ownership]
+
+nodes_2017[, .(median_outdeg = median(outdeg, na.rm=T),
+               mean_outdeg = mean(outdeg, na.rm=T),
+               max_outdeg = max(outdeg, na.rm=T)), by=ownership]
+
+```
+
+```{r}
+nodes_2017[, .(median_indeg = median(indeg, na.rm=T),
+               mean_indeg = mean(indeg, na.rm=T),
+               max_indeg = max(indeg, na.rm=T)), by=indus]
+
+nodes_2017[, .(median_outdeg = median(outdeg, na.rm=T),
+               mean_outdeg = mean(outdeg, na.rm=T),
+               max_outdeg = max(outdeg, na.rm=T)), by=indus]
+
+```
+
+#### Top degree firms breakdown
+```{r}
+k = 1000
+
+tmp <- data.table(table(nodes_2017[order(indeg, decreasing = T)][1:k, indus]))
+tmp_n <- nodes_2017[,.N,indus]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="indus")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(industry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+
+tmp <- data.table(table(nodes_2017[order(indeg, decreasing = T)][1:k, ownership]))
+tmp_n <- nodes_2017[,.N,ownership]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="ownership")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(ownershiptry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+```
+
+
+### Eigenvector centrality
+Eigenvector centrality measures the influence / importance of a company in the network. High eigenvector centrality of a vectex is large if the vertex has many neighbors and/or has important neighbors. To some extent, eigenvector centrality is similar to in/out-degree centrality. However, in/out-degree centrality only counts the number of direct investments made by an investor, while eigenvector accounts for all direct and indirect investments. 
+
+
+The eigenvector centrality $\textbf{x}$ is 
+$$A\textbf{x} = \lambda_1 \textbf{x}$$
+where $\lambda_1$ is the leading eigenvalue.
+
+The eigenvector centrality of vertice $v_i$ is
+
+$$x_i = \frac{1}{\lambda_i} \sum_j A_{ij} x_j$$
+
+```{r eigen cal}
+edges_rev <- network_2017[,.(to=new_entid_investor, from=new_entid_invested, weight=share)]
+g_rev <- graph_from_data_frame(edges_rev, T, nodes)
+E(g_rev)$weight[E(g_rev)$weight==0] <- 1
+E(g_rev)$weight[is.na(E(g_rev)$weight)] <- 1
+eigen_cent_rev <- eigen_centrality(g_rev)$vector
+rm(list=c("g_rev", "edges_rev"))
+```
+
+```{r eigen cash}
+edges_cash <- network_2017[,.(to=new_entid_investor, from=new_entid_invested, weight=cash)]
+g_cash <- graph_from_data_frame(edges_cash, T, nodes)
+E(g_cash)$weight[E(g_cash)$weight==0] <- 1
+E(g_cash)$weight[is.na(E(g_cash)$weight)] <- 1
+eigen_cent_cash <- eigen_centrality(g_cash)$vector
+```
+
+```{r eigen plot}
+hist(log10(eigen_cent_rev), main="Histogram of log10(eigenvector centrality)")
+# g <- set_vertex_attr(g, "eigen_rev", V(g), eigen_cent_rev)
+nodes_2017$eigen <- eigen_cent_rev
+nodes_2017$eigen_cash <- eigen_cent_cash
+sample_index <- sample(1:nrow(nodes_2017), 10000)
+plot(log10(nodes_2017[sample_index, eigen]), log10(nodes_2017[sample_index, eigen_cash]))
+```
+
+Here is the list of firms with top eigenvector centrality, which are the influential firms. 
+
+```{r top eigen, echo=F, results='asis'}
+xtable(print(nodes_2017[!is.na(firmname)][order(eigen,decreasing = T),.(firmname, indus, ownership, reg_capital, eigen)][1:10]),include.rownames=F)
+```
+
+#### Summary by group 
+```{r}
+nodes_2017[, .(median_eigen = median(eigen, na.rm=T),
+               mean_eigen = mean(eigen, na.rm=T),
+               max_eigen = max(eigen, na.rm=T)), by=ownership]
+```
+
+```{r}
+nodes_2017[, .(median_eigen = median(eigen, na.rm=T),
+               mean_eigen = mean(eigen, na.rm=T),
+               max_eigen = max(eigen, na.rm=T)), by=indus]
+
+```
+
+#### Top degree firms breakdown
+```{r}
+k = 1000
+
+tmp <- data.table(table(nodes_2017[order(eigen, decreasing = T)][1:k, indus]))
+tmp_n <- nodes_2017[,.N,indus]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="indus")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(industry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+
+tmp <- data.table(table(nodes_2017[order(eigen, decreasing = T)][1:k, ownership]))
+tmp_n <- nodes_2017[,.N,ownership]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="ownership")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(ownershiptry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+```
+
+
+### Eigenvector centrality using cash
+
+Here is the list of firms with top eigenvector centrality, which are the influential firms. 
+
+```{r top eigen_cash, echo=F, results='asis'}
+xtable(print(nodes_2017[!is.na(firmname)][order(eigen_cash,decreasing = T),.(firmname, indus, ownership, reg_capital, eigen_cash)][1:10]),include.rownames=F)
+```
+
+#### Summary by group 
+```{r}
+nodes_2017[, .(median_eigen_cash = median(eigen_cash, na.rm=T),
+               mean_eigen_cash = mean(eigen_cash, na.rm=T),
+               max_eigen_cash = max(eigen_cash, na.rm=T)), by=ownership]
+```
+
+```{r}
+nodes_2017[, .(median_eigen_cash = median(eigen_cash, na.rm=T),
+               mean_eigen_cash = mean(eigen_cash, na.rm=T),
+               max_eigen_cash = max(eigen_cash, na.rm=T)), by=indus]
+
+```
+
+#### Top degree firms breakdown
+```{r}
+k = 1000
+
+tmp <- data.table(table(nodes_2017[order(eigen_cash, decreasing = T)][1:k, indus]))
+tmp_n <- nodes_2017[,.N,indus]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="indus")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(industry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+
+tmp <- data.table(table(nodes_2017[order(eigen_cash, decreasing = T)][1:k, ownership]))
+tmp_n <- nodes_2017[,.N,ownership]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="ownership")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(ownershiptry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+```
+
+There is no relationships between eigen_cashvector centrality and registered captical from below 
+```{r}
+tmp <- nodes_2017[order(eigen_cash,decreasing = T),.(firmname, reg_capital, eigen_cash)][1:1000]
+eigen_cash <- lm(reg_capital~log(eigen_cash+0.01), tmp)
+plot(log10(tmp$eigen_cash+0.01), tmp$reg_capital, xlim=c(-2,-1.8))
+abline(a=coef(eigen_cash)[1], b=coef(eigen_cash)[2])
+```
+
+
+### Eigenvector with weight
+
+We reweight the weight matrix as $A_{ij} = \frac{\text{cash}_{ij}}{\text{reg capital}_{i}}= \frac{c_{ij}}{v_{i}}$, then 
+
+$$\lambda v_i x_i = \sum_j c_{ij}x_j$$
+where $\lambda$ is the largest eigenvalue. Then we can interpret $x_i$ as the marginal investment return of $firm_i$. There are related literatures in innovation network and asset pricing with centrality.
+
+
+```{r eigenvector weighted, eval=F}
+edges_tmp <- network_2017[,.(from=new_entid_investor, to=new_entid_invested, cash=cash)]
+
+edges_tmp <- merge(edges_tmp, basic_info[,.(new_entid=as.character(new_entid), 
+                                            reg_capital)], by.x="from", by.y="new_entid")
+ninv_notin_info <- length(unique(edges$from)) - length(unique(edges_tmp$from)) 
+n_missing_reg_cap_edges <- edges_tmp[is.na(reg_capital) | reg_capital==0, .N]
+n_missing_reg_cap <- length(unique(edges_tmp[is.na(reg_capital), from]))
+n_missing_weights <- edges_tmp[is.na(cash), .N]
+
+# remove 0 and na reg_cap
+# change NA cash to 1
+# reweight as above
+edges_tmp <- edges_tmp[!is.na(reg_capital) & reg_capital!=0]
+edges_tmp <- edges_tmp[is.na(cash), cash:=1]
+edges_tmp <- edges_tmp[, weight:=cash/reg_capital]
+
+g_weighted <- graph_from_data_frame(edges_tmp, T)
+
+eigen_weighted <- eigen_centrality(g_weighted, directed = T)
+
+nodes <- get.data.frame(g_weighted, "vertices")
+nodes <- setDT(nodes)
+nodes$eigen_w <- eigen_weighted$vector
+nodes <- merge(nodes, 
+               basic_info[,.(name=as.character(new_entid), indus, firmname=name, reg_capital, ownership)],
+                 by = "name", all.x=T, all.y=F)
+nodes <- nodes[!duplicated(name),]
+
+inv_by_investor <- edges_tmp[,.(sum_inv=sum(cash),
+                                sum_inv_ratio=sum(weight)), by=from]
+h <- hist(inv_by_investor[sum_inv_ratio<10, sum_inv_ratio], plot=F)
+h$counts=h$counts/sum(h$counts)
+plot(h, 
+     xlab="sum_of_inv/reg cap", ylab="Percent of investors",
+     main="Histogram of sum_of_inv/reg_cap")
+# fwrite(merge(basic_info[,.(new_entid=as.character(new_entid),
+#                            name,
+#                            reg_capital=reg_capital,
+#                            indus=indus, ownership=ownership)],
+#              inv_by_investor,
+#              by.x="new_entid", by.y="from", all.x=F, all.y=T),
+#        "misc/2002_inv_by_investor.csv", row.names = F)
+```
+
+
+### Betweenness
+Betweenness is defined as the number of times that it acts as the bridge on the shortest path of two other vertices in the graph. It serves as a way to discover bow-tie structure within a network. Imagine two groups of vertices  $C_1$ and $C_2$  connected by a single vertex $v$, we naturally expect $v$ to have a large value of betweenness, because if v is removed, the communication between $C_1$ and $C_2$ will be cut off. More importantly, it measures how significant an intermediary entity is in an indirect investment. 
+
+Denote the shortest path between two vertices $v_s$ and $v_t$ as $d(v_s, v_t)$. Weights of edges can be incorporated into calculating the shortest path. A vertex $v_i$ lies on the shortest path between vertices $v_s$ and $v_t$ if and only if $d(v_s, v_t) = d(v_s, v_i) + d(v_i, v_t)$. Then the betweenness centrality of vertex $v_i$ is defined as
+
+$$Betweenness(v_i) = \sum_{s \neq t \neq i} \delta_{s,t}(i)$$
+
+where $\delta_{s,t}(i) = 1$ if $d(v_s, v_t) = d(v_s, v_i) + d(v_i, v_t)$ else 0.
+
+
+```{r between cal}
+E(g)$weight[E(g)$weight==0] <- 1
+E(g)$weight[is.na(E(g)$weight)] <- 1
+btw <- estimate_betweenness(g, cutoff=4)
+
+nodes_2017$between <- btw
+```
+
+
+`r percent(sum(btw==0)/length(btw))` of the firms have betweenness as 0. The distribution is also heavily right-skwed. 
+
+(Tried to calculate undirected betweenness not working)
+
+
+```{r between}
+summary(btw[which(btw>0)])
+hist(log10(btw[which(btw>0)]), main="log10(Betweeness)")
+```
+
+
+The firms with top 10 betweenness are listed as follows.
+
+```{r top btw, echo=F, results='asis'}
+xtable(print(nodes_2017[!is.na(firmname)][order(between,decreasing = T),.(firmname, indus, ownership, reg_capital, between)][1:10]),include.rownames=F)
+```
+
+#### Summary by group 
+```{r}
+nodes_2017[, .(median_between = median(between, na.rm=T),
+               mean_between = mean(between, na.rm=T),
+               max_between = max(between, na.rm=T)), by=ownership]
+
+```
+
+```{r}
+nodes_2017[, .(median_between = median(between, na.rm=T),
+               mean_between = mean(between, na.rm=T),
+               max_between = max(between, na.rm=T)), by=indus]
+```
+
+#### Top degree firms breakdown
+```{r}
+k = 1000
+
+tmp <- data.table(table(nodes_2017[order(between, decreasing = T)][1:k, indus]))
+tmp_n <- nodes_2017[,.N,indus]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="indus")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(industry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+
+tmp <- data.table(table(nodes_2017[order(between, decreasing = T)][1:k, ownership]))
+tmp_n <- nodes_2017[,.N,ownership]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="ownership")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(ownershiptry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+```
+
+
+
+### Hub centrality
+```{r hub}
+E(g)$weight[E(g)$weight==0] <- 1
+E(g)$weight[is.na(E(g)$weight)] <- 1
+hub <- hub_score(g)
+nodes_2017$hub <- hub$vector
+```
+
+The firms with top 10 hub score are listed as follows.
+
+```{r top hub, echo=F, results='asis'}
+xtable(print(nodes_2017[!is.na(firmname)][order(hub,decreasing = T),.(firmname, indus, ownership, reg_capital, hub)][1:10]),include.rownames=F)
+```
+
+#### Summary by group 
+```{r}
+nodes_2017[, .(median_hub = median(hub, na.rm=T),
+               mean_hub = mean(hub, na.rm=T),
+               max_hub = max(hub, na.rm=T)), by=ownership]
+
+```
+
+```{r}
+nodes_2017[, .(median_hub = median(hub, na.rm=T),
+               mean_hub = mean(hub, na.rm=T),
+               max_hub = max(hub, na.rm=T)), by=indus]
+```
+
+#### Top degree firms breakdown
+```{r}
+k = 1000
+
+tmp <- data.table(table(nodes_2017[order(hub, decreasing = T)][1:k, indus]))
+tmp_n <- nodes_2017[,.N,indus]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="indus")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(industry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+
+tmp <- data.table(table(nodes_2017[order(hub, decreasing = T)][1:k, ownership]))
+tmp_n <- nodes_2017[,.N,ownership]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="ownership")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(ownershiptry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+```
+
+### Hub centrality using cash as weight
+```{r hub cash}
+E(g_cash)$weight[E(g_cash)$weight==0] <- 1
+E(g_cash)$weight[is.na(E(g_cash)$weight)] <- 1
+hub_cash <- hub_score(g_cash)
+authority_cash <- authority_score(g_cash)
+nodes_2017$hub_cash <- hub_cash$vector
+nodes_2017$authority_cash <- authority_cash$vector
+rm(list=c("g_cash", "edges_cash"))
+```
+
+
+```{r}
+sample_index <- sample(1:nrow(nodes_2017), 10000)
+plot(nodes_2017[sample_index, hub], nodes_2017[sample_index, hub_cash])
+plot(nodes_2017[sample_index, hub_cash], nodes_2017[sample_index, authority_cash])
+```
+
+The firms with top 10 hub_cash score are listed as follows.
+
+```{r top hub cash, echo=F, results='asis'}
+xtable(print(nodes_2017[!is.na(firmname)][order(hub_cash,decreasing = T),.(firmname, indus, ownership, reg_capital, hub_cash)][1:10]),include.rownames=F)
+```
+
+#### Summary by group 
+```{r}
+nodes_2017[, .(median_hub_cash = median(hub_cash, na.rm=T),
+               mean_hub_cash = mean(hub_cash, na.rm=T),
+               max_hub_cash = max(hub_cash, na.rm=T)), by=ownership]
+
+```
+
+```{r}
+nodes_2017[, .(median_hub_cash = median(hub_cash, na.rm=T),
+               mean_hub_cash = mean(hub_cash, na.rm=T),
+               max_hub_cash = max(hub_cash, na.rm=T)), by=indus]
+```
+
+#### Top degree firms breakdown
+```{r}
+k = 1000
+
+tmp <- data.table(table(nodes_2017[order(hub_cash, decreasing = T)][1:k, indus]))
+tmp_n <- nodes_2017[,.N,indus]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="indus")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(industry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+
+tmp <- data.table(table(nodes_2017[order(hub_cash, decreasing = T)][1:k, ownership]))
+tmp_n <- nodes_2017[,.N,ownership]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="ownership")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[,.(ownershiptry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+```
+
+
+
+The firms with top 10 authority_cash score are listed as follows.
+
+```{r top authority cash, echo=F, results='asis'}
+xtable(print(nodes_2017[!is.na(firmname)][order(authority_cash,decreasing = T),.(firmname, indus, ownership, reg_capital, authority_cash)][1:10]),include.rownames=F)
+```
+
+#### Summary by group (authority)
+```{r}
+nodes_2017[, .(median_authority_cash = median(authority_cash, na.rm=T),
+               mean_authority_cash = mean(authority_cash, na.rm=T),
+               max_authority_cash = max(authority_cash, na.rm=T)), by=ownership]
+
+```
+
+```{r}
+nodes_2017[, .(median_authority_cash = median(authority_cash, na.rm=T),
+               mean_authority_cash = mean(authority_cash, na.rm=T),
+               max_authority_cash = max(authority_cash, na.rm=T)), by=indus]
+```
+
+#### Top degree firms breakdown (authority)
+```{r}
+k = 1000
+
+tmp <- data.table(table(nodes_2017[order(authority_cash, decreasing = T)][1:k, indus]))
+tmp_n <- nodes_2017[,.N,indus]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="indus")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[order(freq, decreasing = T)][,.(industry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+
+tmp <- data.table(table(nodes_2017[order(authority_cash, decreasing = T)][1:k, ownership]))
+tmp_n <- nodes_2017[,.N,ownership]
+tmp <- merge(tmp, tmp_n, by.x="V1", by.y="ownership")
+tmp$freq <- tmp$N.x/tmp$N.y
+xtable(print(tmp[order(freq, decreasing = T)][,.(ownershiptry=V1, num_in_top=N.x, freq_in_top=percent(freq))], include.rownames=F))
+```
+
+
+### Katz
+```{r katz}
+# katz <- alpha_centrality(g, alpha=0.9)
+
+```
+
+### Closeness
+```{r close}
+# closeness <- estimate_closeness(g, cutoff = 4, mode="out")
+
+```
+
+### output
+```{r centra 2017}
+nodes_2017 <- get.data.frame(g, "vertices")
+nodes_2017 <- setDT(nodes_2017)
+
+# fill in the centrality measurement
+nodes_2017$indeg <- indeg
+nodes_2017$outdeg <- outdeg
+nodes_2017$between <- btw
+nodes_2017$eigen <- eigen_cent_rev
+
+# fwrite(nodes_2017%>%select(name, firmname, indeg, outdeg, between, eigen), "centrality/centrality_2017.csv", 
+#       row.names = F)
+```
+
+```{r centra 2017-2, eval=F}
+nodes_2017$eigen_cash <- eigen_cent_cash
+nodes_2017$hub_cash <- hub_cash
+```
+
+```{r plot centrality 2017, eval=F}
+write_plot_centrality(nodes = nodes_2017, 
+                      dir = "../Tables & Figures/Centrality/", 
+                      filename = "2017")
+```
+
+### Two-way table of between 
+```{r centrality two-way 1}
+# View(nodes_2017[order(between, decreasing=T)])
+# View(nodes_2017[order(eigen, decreasing=T)])
+
+nodes_2017[, .(median_reg_cap=median(reg_capital, na.rm=T)), by=(between>100)]
+nodes_2017[, .(median_reg_cap=median(reg_capital, na.rm=T)), by=list(between>100, ownership)][order(ownership)]
+
+nodes_2017[between>0, .(median_btw=median(between, na.rm = T), median_eigen=median(eigen, na.rm = T)), by=ownership][order(median_eigen,decreasing = T)]
+nodes_2017[between>0, .(median_btw=median(between, na.rm = T), median_eigen=median(eigen, na.rm = T)), by=indus][order(median_eigen,decreasing = T)]
+
+nodes_2017[between>0, .(max_btw=max(between, na.rm = T), max_eigen=max(eigen, na.rm = T)), by=ownership][order(max_eigen,decreasing = T)]
+nodes_2017[between>0, .(max_btw=max(between, na.rm = T), max_eigen=max(eigen, na.rm = T)), by=indus][order(max_eigen,decreasing = T)]
+```
+
+### Relationship between centrality
+```{r centrality relationship}
+sample_index <- sample(1:nrow(nodes_2017), 10000)
+
+# outdeg_vs_between <- lm(outdeg ~ between, nodes_2017)
+plot(log10(nodes_2017[sample_index, between]+0.01), log10(nodes_2017[sample_index, outdeg]+0.01))
+# abline(a=coef(outdeg_vs_between)[1], b=coef(outdeg_vs_between)[2])
+
+# outdeg_vs_eigen <- lm(outdeg ~ eigen, nodes_2017)
+plot(log10(nodes_2017[sample_index, eigen]+0.01), log10(nodes_2017[sample_index, outdeg]+0.01))
+# abline(a=coef(outdeg_vs_eigen)[1], b=coef(outdeg_vs_eigen)[2])
+
+# between_vs_eigen <- lm(between ~ eigen, nodes_2017)
+plot(log10(nodes_2017[sample_index, eigen]+0.01), log10(nodes_2017[sample_index, between]+0.01))
+# abline(a=coef(between_vs_eigen)[1], b=coef(between_vs_eigen)[2])
+
+idx_eigen <- which(eigen_cent_cash>0)
+plot(log10(eigen_cent_cash[idx_eigen]+0.01), log10(nodes_2017[idx_eigen, between]+0.01))
+
+plot(log10(eigen_cent_cash[idx_eigen]+0.01), log10(nodes_2017[idx_eigen, outdeg]+0.01))
+
+plot(log10(eigen_cent_cash[idx_eigen]+0.01), log10(nodes_2017[idx_eigen, indeg]+0.01))
+
+plot(log10(eigen_cent_cash[idx_eigen]+0.01), log10(hub_cash$vector[idx_eigen]+0.01))
+
+# rm(list=c("outdeg_vs_between", "outdeg_vs_eigen", "between_vs_eigen"))
+```
+
+### power law
+The tail distribution of centrality follows
+$$Pr(X > x) = x^{-\alpha}$$
+```{r power law centrality}
+```
+
+```{r power law}
+cl <- clusters(g)
+cl_tbl <- table(cl$csize)
+cl_tbl_hist <- data.frame(num_cluster=cl_tbl[2:10])
+cl_tbl_hist$num_cluster.Var1 <- as.character(cl_tbl_hist$num_cluster.Var1)
+cl_tbl_hist[9,1] <- ">=10"
+cl_tbl_hist[9,2] <- sum(cl_tbl[10:length(cl_tbl)])
+names(cl_tbl_hist) <- c("cluster_size", "num_cluster")
+cl_tbl_hist$cluster_size <- factor(cl_tbl_hist$cluster_size, levels=c(seq(2,9), ">=10"))
+
+png("misc/hist_clusters.png", width = 1000, height = 600)
+cl_tbl_hist %>%
+  ggplot() + geom_bar(aes(x=factor(cluster_size), y=num_cluster, fill=num_cluster), stat="identity") +
+    ggtitle("Number of clusters of different sizes") + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  xlab("Cluster size") + ylab("Number of clusters") + 
+  scale_fill_distiller(type="seq", palette="YlGnBu", direction=1)
+dev.off()
+
+# ggplot(cl_tbl_hist, aes(x=cluster_size, y=)) + 
+#   geom_bar(aes(fill=num_cluster)) + 
+#   xlab("Year") + ggtitle("Figure 2: Number of Data Entry (1998-2013)") + 
+#   scale_fill_distiller(type="seq", palette="YlGnBu", direction=1)
+
+```
+
+### Structral plot
+```{r adj mat in out deg, message=FALSE, warning=FALSE, eval=F}
+sample_idx <- sample(1:nrow(nodes_2017), 1000000)
+g_sub <- induced_subgraph(g, V(g)[sample_idx])
+g_sub_nodes <- nodes_2017[sample_idx,]
+g_sub_edges <- get.data.frame(g_sub, "edges")
+g_sub_nodes <- g_sub_nodes[order(g_sub_nodes$eigen, decreasing=T),]
+g_sub_eigen <- graph_from_data_frame(g_sub_edges, T, g_sub_nodes)
+g_sub_adj <- as_adjacency_matrix(g_sub_eigen)
+
+image(g_sub_adj,
+      main="2017 Adjacency Matrix of 1000k samples by eigen")
+
+```
+
+We randomly take 1000k samples and sorted by outdegree and indegree.
+
+```{r, echo=FALSE, fig.cap="", out.width = '100%'}
+knitr::include_graphics("../Tables_Figures/Adjacency_Matrix/2017_by_outdeg.png")
+```
+
+```{r, echo=FALSE, fig.cap="", out.width = '100%'}
+knitr::include_graphics("../Tables_Figures/Adjacency_Matrix/2017_by_indeg.png")
+```
+
+# SOE Tree
+```{r}
+fit_power_law(outdeg)
+fit_power_law(indeg)
+fit_power_law(btw)
+# fit_power_law(eigen)
+dd <- degree_distribution(g, mode="in", cumulative = T)
+plot(dd)
+
+```
+
+## Provincial heatmap
+```{r heatmap investor, eval=F}
+map.source <- c("../../AllData/AIS/data/map/bou2_4p.shp")
+mapdata <- map.preprocessor(map.source)
+
+network_2012 <- network_2012[,countycode_2digit:=substr(citycode_investor,1,2)]
+network_2012 <- network_2012[,countycode_2digit:=ifelse(is.na(countycode_2digit), NA, paste(countycode_2digit,"0000",sep=""))]
+
+sum_regcap_investor <- network_2012[, log(sum(reg_cap_investor, na.rm = T)+0.01), by=countycode_2digit]
+names(sum_regcap_investor) <- c("countyid", "ret")
+png("heatmap/2012_sum_reg_cap_investor.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, sum_regcap_investor, title="Log Sum of Registration capital of investors (2012)", c(14,25), legend="logSum(10kRMB)")
+dev.off()
+
+mean_regcap_investor <- network_2012[, log(mean(reg_cap_investor, na.rm = T)), by=countycode_2digit]
+names(mean_regcap_investor) <- c("countyid", "ret")
+png("heatmap/2012_mean_reg_cap_investor.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, mean_regcap_investor, title="Log Mean of Registration capital of investors (2012)", c(8,13), legend="logMean(10kRMB)")
+dev.off()
+
+sum_cash <- network_2012[, log(sum(cash, na.rm = T)), by=countycode_2digit]
+names(sum_cash) <- c("countyid", "ret")
+png("heatmap/2012_sum_inv.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, sum_cash, title="Log Sum of investment (2012)", c(14,25), legend="logSum(10kRMB)", textcol = "black")
+dev.off()
+
+mean_cash <- network_2012[, log(mean(cash, na.rm = T)), by=countycode_2digit]
+names(mean_cash) <- c("countyid", "ret")
+png("heatmap/2012_mean_inv.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, mean_cash, title="Log Mean of investment (2012)", c(7,13), legend="logMean(10kRMB)", textcol = "black")
+dev.off()
+
+n_inv <- network_2012[, .N, by=countycode_2digit]
+names(n_inv) <- c("countyid", "ret")
+png("heatmap/2012_num_of_inv.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, n_inv, title="Number of investments (2012)", legend="Number of investments", textcol = "black")
+dev.off()
+
+network_2012_ <- unique(network_2012, by="new_entid_investor")
+n_investor <- network_2012_[, .N, by=countycode_2digit]
+names(n_investor) <- c("countyid", "ret")
+png("heatmap/2012_num_of_investors.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, n_investor, title="Number of investors (2012)", legend="Number of investors", textcol = "black")
+dev.off()
+```
+
+```{r heatmap investee, eval=F}
+network_2012 <- merge(network_2012, basic_info[,.(new_entid, cnty_code)], 
+                      by.x="new_entid_invested", by.y="new_entid", all.x=T, all.y=F)
+network_2012 <- network_2012[,countycode_investee_2digit:=substr(cnty_code,1,2)]
+network_2012 <- network_2012[,countycode_investee_2digit:=ifelse(is.na(countycode_investee_2digit),
+                                                                 NA, paste(countycode_investee_2digit,"0000",sep=""))]
+
+sum_regcap_invested <- network_2012[, log(sum(reg_cap_invested, na.rm = T)+0.01), by=countycode_investee_2digit]
+names(sum_regcap_invested) <- c("countyid", "ret")
+png("heatmap/2012_sum_reg_cap_invested.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, sum_regcap_invested, title="Log Sum of Registration capital of investees (2012)", c(10,22.5), legend="logSum(10kRMB)")
+dev.off()
+
+mean_regcap_investor <- network_2012[, log(mean(reg_cap_invested, na.rm = T)), by=countycode_investee_2digit]
+names(mean_regcap_investor) <- c("countyid", "ret")
+png("heatmap/2012_mean_reg_cap_invested.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, mean_regcap_investor, title="Log Mean of Registration capital of investees (2012)", c(8,14), legend="logMean(10kRMB)")
+dev.off()
+
+sum_cash <- network_2012[, log(sum(cash, na.rm = T)), by=countycode_investee_2digit]
+names(sum_cash) <- c("countyid", "ret")
+png("heatmap/2012_sum_inv_to_invested.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, sum_cash, title="Log Sum of investment to investees (2012)", c(17,23.5), legend="logSum(10kRMB)", textcol = "black")
+dev.off()
+
+mean_cash <- network_2012[, log(mean(cash, na.rm = T)), by=countycode_investee_2digit]
+names(mean_cash) <- c("countyid", "ret")
+png("heatmap/2012_mean_inv_to_invested.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, mean_cash, title="Log Mean of investment to investees (2012)", c(8,16), legend="logMean(10kRMB)", textcol = "black")
+dev.off()
+
+n_inv <- network_2012[, .N, by=countycode_investee_2digit]
+names(n_inv) <- c("countyid", "ret")
+png("heatmap/2012_num_of_inv_to_invested.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, n_inv, title="Number of investments to investees (2012)", legend="Number of investments", textcol = "black")
+dev.off()
+
+network_2012_ <- unique(network_2012, by="new_entid_invested")
+n_investor <- network_2012_[, .N, by=countycode_investee_2digit]
+names(n_investor) <- c("countyid", "ret")
+png("heatmap/2012_num_of_investees.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, n_investor, title="Number of investees (2012)", legend="Number of investors", textcol = "black")
+dev.off()
+
+n_inv_guangdong <- network_2012[countycode_2digit=="440000", .N, by=countycode_investee_2digit]
+names(n_inv_guangdong) <- c("countyid", "ret")
+png("heatmap/2012_num_of_inv_to_invested_guangdong.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, n_inv_guangdong, title="Number of investments from Guangdong to investees (2012)", c(100,5500), legend="Number of investments", textcol = "black")
+dev.off()
+
+n_inv_beijing <- network_2012[countycode_2digit=="110000", .N, by=countycode_investee_2digit]
+names(n_inv_beijing) <- c("countyid", "ret")
+png("heatmap/2012_num_of_inv_to_invested_beijing.png", width = 1000, height = 1000)
+plot.heat.map(mapdata, n_inv_beijing, title="Number of investments from Beijing to investees (2012)", c(100,11000), legend="Number of investments", textcol = "black")
+dev.off()
+```
+
+# 1/10 Jon Kleinberg
+Discussed identifying central nodes and community detection
+
+**central nodes**
+
+* We can see what effects would have if we take away the centroids (e.g. SOEs)
+    + would it break lots of connections
+    + and thus break the power law of the centrality distribution?
+    
+**community detection**
+
+* If we have ground truth of the communty (say SOEs control communities in order to control the economy), refer to https://cs.stanford.edu/people/jure/pubs/comscore-icdm12.pdf
+    + Compare partitions only by industry/ownership and by modularity maximization
+    + FDR of clusters? 
+* Community detection by modularity maximization will usually lead to loss of connetions, resulting in losing centroids in some communities
+* Bootstrap sub-graph and see how it affects
+
+No conclusions on identifying centroids and detecting communities at the same time.
+    
+**Prediction**
+We can transform SOE identification into a prediction problem.
+    
+**Flows**: refer to a preliminary work of interbank flow
+https://www.newyorkfed.org/medialibrary/media/research/staff_reports/sr243.pdf
+
+# 1/11 Notes
+
+* Compare the tail distribution of centrality by cash and share
+* SOE tree
+    + Compare structures in and not in SOE tree (size, centrality distribution etc)
+
+# 1/16 Sen
+
+* SBM: there exists models that incorporate power law of degree 
+
+# 1/19
+
+* cross-sectional cluster effect: cluster size, SOE in community 

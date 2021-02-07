@@ -1,0 +1,345 @@
+---
+title: "Chinese economy network analysis"
+output:
+  word_document:
+    toc: yes
+  pdf_document:
+    extra_dependencies:
+      ctexcap: UTF8
+    latex_engine: xelatex
+    toc: yes
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, cache=T)
+pacman::p_load(ggplot2, data.table, stringr, dplyr, tidyr, 
+               glmnet, xtable, doParallel, scales, plm, lfe, lme4, igraph)
+
+# source("../../AllData/AIS/R/heatmap.R")
+
+if(.Platform$OS.type=="windows") {
+  setwd("C:/Users/junhui/Dropbox (Penn)/Linda_Wu Zhu/Data & Codes")
+  Sys.setlocale(category = "LC_CTYPE", locale = "chs")
+}
+
+source("src/utilities.R")
+```
+
+```{r read long panel, cache.lazy=FALSE}
+years <- seq(2002, 2017)
+nets <- paste("net", years, sep="")
+pan <- list()
+for (i in years) {
+  v <- fread(paste("dynamic_networks/holding_networks_", i, "_WT.csv", sep=""),
+             header = T, encoding = "UTF-8", stringsAsFactors = F)
+  v$year <- i
+  pan[[i]] <- v
+}
+pan <- rbindlist(pan)
+```
+
+# EDA
+## Number of investors and investees
+```{r}
+num_investor_investee <- data.table(year         = years, 
+                                    num_investor = pan[,length(unique(new_entid_investor)), by=year][,V1],
+                                    num_investee = pan[,length(unique(new_entid_invested)), by=year][,V1])
+
+num_investor_investee %>% melt(id.vars = "year") %>%
+  ggplot() + geom_bar(aes(x=year, y=value, fill=variable), stat="identity", position="dodge") +
+    ggtitle("Number of investors and investees across years") + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  xlab("Year") + ylab("Number of investors/investees") 
+```
+
+```{r xtable num investor investee, echo=F, message=F, results='asis'}
+print(xtable(num_investor_investee), include.rownames=F)
+```
+## Sum of investment across year
+```{r invest cash across year}
+pan[, sum(cash, na.rm=T), by=year] %>% rename(investment = V1) %>%
+  ggplot() + geom_bar(aes(x=year, y=investment, fill=investment), stat="identity") +
+    ggtitle("Sum of investment") + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  xlab("Year") + ylab("Investment") + 
+  scale_fill_distiller(type="seq", palette="YlGnBu", direction=1)
+
+```
+
+```{r xtable sum inv, echo=F, message=F, results='asis'}
+print(xtable(pan[, sum(cash, na.rm=T), by=year] %>% rename(investment = V1)), include.rownames=F)
+```
+
+## Number of firms established across year
+
+## Number of entrants and exits of the network
+```{r in-out}
+entrants_exiting_table <- data.table(year     = seq(2003, 2017), 
+                                     entrants = rep(0, 15), 
+                                     exit     = rep(0, 15))
+for(i in seq(2003, 2017)) {
+  print(i)
+  firm_pre_year <- unique(c(pan[year==(i-1), new_entid_invested], pan[year==(i-1), new_entid_investor]))
+  firm_cur_year <- unique(c(pan[year==(i), new_entid_invested], pan[year==(i), new_entid_investor]))
+  entrants_exiting_table[year==i, exit:=as.integer(sum(!(firm_pre_year %in% firm_cur_year)))]
+  entrants_exiting_table[year==i, entrants:=as.integer(sum(!(firm_cur_year %in% firm_pre_year)))]
+}
+
+entrants_exiting_table %>% melt(id.vars = "year") %>%
+  ggplot() + geom_bar(aes(x=year, y=value, fill=variable), stat="identity", position="dodge") +
+    ggtitle("Number of entrants and exits across years") + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  xlab("Year") + ylab("Number of entrants/exits") 
+```
+
+```{r xtable in out, echo=F, message=F, results='asis'}
+print(xtable(entrants_exiting_table), include.rownames=F)
+```
+
+## Firms with sum invest amount change (registered capital changed?)
+```{r reg cap changed}
+tmp = pan[, sum(cash, na.rm=T), by=c("year", "new_entid_invested")]
+changed_regcap <- tmp[, length(unique(V1))!=1, by=new_entid_invested]
+entid_changed_regcap <- changed_regcap[V1==TRUE, new_entid_invested]
+entid_changed_year <- tmp[new_entid_invested %in% entid_changed_regcap,
+                          year[1+which(diff(V1)!=0)], by=new_entid_invested]
+View(tmp[new_entid_invested %in% entid_changed_regcap])
+
+plot_discrete_range(entid_changed_year$V1, name="Number of firms changed regcap")
+```
+There are in total `r length(entid_changed_regcap)` of firms changed registered capital.
+
+
+```{r update info, cache=F}
+update_info <- fread("update_info/update_info_v2.csv", encoding = "UTF-8")
+update_info <- update_info[, year:=substr(dateid, 0, 4)]
+tmp = update_info[, .(sum_before = sum(beforecash, na.rm=T),
+                      sum_after = sum(aftercash, na.rm=T)), 
+                  by=c("year", "entid_invested")]
+changed_regcap <- tmp[sum_before!=sum_after][order(year)]
+plot_discrete_range(changed_regcap$year, range = c(1982, 2017), name="Number of firms changed regcap")
+```
+
+## Match AIS
+### Summary statistics of ROA across year
+
+# cnpc
+```{r cnpc}
+cnpc <- pan[new_entid_investor=="551997"]
+
+cnpc[, .N, by=year] %>% rename(num_inv = N) %>% 
+ggplot() + geom_bar(aes(x=year, y=num_inv, fill=num_inv), stat="identity") +
+    ggtitle("Num of investment") + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  xlab("Year") + ylab("Investment") + 
+  scale_fill_distiller(type="seq", palette="YlGnBu", direction=1)
+```
+
+```{r cnpc sum}
+cnpc[, sum(cash, na.rm=T), year] %>% rename(sum_inv = V1) %>%
+ggplot() + geom_bar(aes(x=year, y=sum_inv, fill=sum_inv), stat="identity") +
+    ggtitle("Sum of investment") + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  xlab("Year") + ylab("Investment") + 
+  scale_fill_distiller(type="seq", palette="YlGnBu", direction=1)
+```
+
+
+```{r xtable cnpc, echo=F, message=F, results='asis'}
+print(xtable(cnpc[new_entid_invested=="552219", .(new_entid_invested, new_entid_investor, cash, share, year)]), include.rownames=F)
+```
+
+
+# Haier
+```{r haier, eval=F}
+num_inv_haier <- pan[new_entid_investor=="5792800", .N, by=year]
+sum_inv_haier <- pan[new_entid_investor=="5792800", sum(cash, na.rm=T), by=year]
+
+```
+
+# Huawei
+```{r huawei, eval=F}
+View(pan[new_entid_invested=="1290817"])
+# Who is huawei's investor? 1290822
+View(pan[new_entid_investor=="1290817"])
+
+```
+
+# Investment changes
+```{r inv change tab}
+inv_change_table <- pan[,sum(length(unique(cash))>1), by=c("new_entid_invested", "new_entid_investor")][V1!=0]
+inv_change_firm <- unique(c(inv_change_table$new_entid_invested, inv_change_table$new_entid_investor))
+# View(basic_info[new_entid%in%inv_change_firm])
+```
+
+There are in total `r nrow(unique(inv_change_table[,.(new_entid_invested, new_entid_investor)]))` (`r percent(nrow(unique(inv_change_table[,.(new_entid_invested, new_entid_investor)]))/nrow(unique(pan[,.(new_entid_invested, new_entid_investor)])))`) pairs of investors and investees changed the amount of investment across the years.
+
+```{r investee change}
+reg_cap_change_investee <- pan[,sum(length(unique(reg_cap_invested))>1), by=new_entid_invested][V1!=0]
+View(pan[new_entid_invested %in% reg_cap_change_investee$new_entid_invested])
+
+```
+
+# Compare regiatered capital vs AIS paidin capital
+```{r read ais and matching, cache=F}
+ais <- fread("C:/Users/junhui/Dropbox (Penn)/AllData/AIS/data/processed_data/panel_name_61.csv", encoding = "UTF-8")
+ais_matching <- fread("AIS_CRCS_Matching/ASCIE_CRCS_matching.csv", encoding = "UTF-8", fill=T)
+```
+
+```{r match ais paid in vs reg cap}
+source("C:/Users/junhui/Dropbox (Penn)/AllData/AIS/R/preprocess_ownership.R")
+ais <- preprocess.cap(ais)
+ais_vs_net <- merge(ais[id!="",.(id, paidincap, year)], 
+                    ais_matching[firm_code!=""], 
+                    by.x=c("id", "year"), by.y=c("firm_code", "year"))
+ais_vs_net <- merge(ais_vs_net, 
+                    pan[new_entid_invested!="",.(new_entid_invested, reg_cap_invested, year)],
+                    by.x=c("new_entid", "year"), by.y=c("new_entid_invested", "year"))
+ais_vs_net <- unique(ais_vs_net, by=c("new_entid", "year"))
+
+# scale paidin cap into 10k
+ais_vs_net <- ais_vs_net[,paidincap:=paidincap/10]
+```
+
+We look into the difference between the paidin capital and registered capital.
+
+We keep those companies with non zero paidin and nonzeor registered capital and thus droppoing `r ais_vs_net[!(paidincap!=0 & reg_cap_invested!=0),.N]/ais_vs_net[,.N]` observations in total acrosss years.
+
+```{r sum paidin vs reg cap}
+paidin_vs_regcap_by_year <- ais_vs_net[paidincap!=0 & reg_cap_invested!=0,
+                                       .(paidincap_sum = sum(paidincap,na.rm = T),
+                                          regcap_sum = sum(reg_cap_invested, na.rm = T)), year]
+
+paidin_vs_regcap_by_year %>% melt(id.vars = "year") %>%
+  ggplot() + geom_bar(aes(x=year, y=value, fill=variable), stat="identity", position="dodge") +
+    ggtitle("Sum of Paidin capital vs Registered capital of investees AIS firms") + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  xlab("Year") + ylab("10k RMB")
+```
+
+```{r padin vs regcap ais investee table, echo=F, message=FALSE, warning=FALSE, results='asis'}
+print(xtable(paidin_vs_regcap_by_year), include.rownames=F)
+```
+
+```{r mean paidin vs reg cap}
+paidin_vs_regcap_mean_by_year <- ais_vs_net[paidincap!=0 & reg_cap_invested!=0,
+                                            .(paidincap_sum = mean(paidincap,na.rm = T),
+                                              regcap_sum = mean(reg_cap_invested, na.rm = T)), year]
+
+paidin_vs_regcap_mean_by_year %>% melt(id.vars = "year") %>%
+  ggplot() + geom_bar(aes(x=year, y=value, fill=variable), stat="identity", position="dodge") +
+    ggtitle("Mean of Paidin capital vs Registered capital of investees AIS firms") + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  xlab("Year") + ylab("10k RMB")
+```
+
+```{r mean padin vs regcap ais investee table, echo=F, message=FALSE, warning=FALSE, results='asis'}
+print(xtable(paidin_vs_regcap_mean_by_year[order(paidin_vs_regcap_mean_by_year[,year])]), include.rownames=F)
+```
+
+```{r hist 2002}
+hist(ais_vs_net[year==2002 & paidincap!=0 & reg_cap_invested!=0, reg_cap_invested-paidincap],breaks=100)
+hist(ais_vs_net[year==2002 & paidincap!=0 & reg_cap_invested!=0 &
+                  reg_cap_invested-paidincap < 1e3 & reg_cap_invested-paidincap > -1e3, reg_cap_invested-paidincap], breaks=100)
+ais_vs_net[year==2002 & paidincap!=0 & reg_cap_invested!=0 &
+                  reg_cap_invested-paidincap < 100 & reg_cap_invested-paidincap > -100, .N]/ais_vs_net[year==2002,.N]
+
+ais_vs_net[paidincap!=0 & reg_cap_invested!=0, diff_rate:=(reg_cap_invested-paidincap)/reg_cap_invested]
+summary(ais_vs_net[paidincap!=0 & reg_cap_invested!=0,diff_rate])
+
+ais_vs_net[paidincap!=0 & reg_cap_invested!=0, mean(diff_rate, na.rm=T), year] %>%
+  rename("diff_rate"=V1) %>%
+ggplot() + geom_bar(aes(x=year, y=diff_rate, fill=diff_rate), stat="identity") +
+    ggtitle("Mean of (Reg_cap - Paidin)/Reg_cap") + 
+    theme(axis.text.x = element_text(angle = 30, hjust = 1)) + 
+  xlab("Year") + ylab("Investment") + 
+  scale_fill_distiller(type="seq", palette="YlGnBu")
+```
+## Serveral firms
+
+
+### SOE: ZTE 27939873X
+
+```{r an gang, echo=F, message=FALSE, warning=FALSE, results='asis'}
+gm <- ais_vs_net[id=="27939873X",.(new_entid, paidincap, reg_cap_invested, year)]
+setkey(gm, year)
+gm_num_investor <- pan[new_entid_invested=="521576",
+    length(unique(new_entid_investor)),by=year]
+gm <- merge(gm, gm_num_investor, by="year")
+setnames(gm, "V1", "num_investor")
+print(xtable(gm), include.rownames=F)
+```
+
+### Collective: Huawei (or private) 192203821
+```{r huawei 2, echo=F, message=FALSE, warning=FALSE, results='asis'}
+gm <- ais_vs_net[id=="192203821",.(new_entid, paidincap, reg_cap_invested, year)]
+setkey(gm, year)
+gm_num_investor <- pan[new_entid_invested=="1290817",
+    length(unique(new_entid_investor)),by=year]
+gm <- merge(gm, gm_num_investor, by="year")
+setnames(gm, "V1", "num_investor")
+print(xtable(gm), include.rownames=F)
+```
+
+
+### HTM: Guangzhou P&G 618404218
+
+```{r png, echo=F, message=FALSE, warning=FALSE, results='asis'}
+gm <- ais_vs_net[id=="618404218",.(new_entid, paidincap, reg_cap_invested, year)]
+setkey(gm, year)
+gm_num_investor <- pan[new_entid_invested=="2612006",
+    length(unique(new_entid_investor)),by=year]
+gm <- merge(gm, gm_num_investor, by="year")
+setnames(gm, "V1", "num_investor")
+print(xtable(gm), include.rownames=F)
+```
+
+
+### Private:　Media  722473344
+
+```{r media, echo=F, message=FALSE, warning=FALSE, results='asis'}
+gm <- ais_vs_net[id=="722473344",.(new_entid, paidincap, reg_cap_invested, year)]
+setkey(gm, year)
+gm_num_investor <- pan[new_entid_invested=="4979839",
+    length(unique(new_entid_investor)),by=year]
+gm <- merge(gm, gm_num_investor, by="year")
+setnames(gm, "V1", "num_investor")
+print(xtable(gm), include.rownames=F)
+```
+
+
+### Private: Wanxiang 142911934
+```{r wanxiang, echo=F, message=FALSE, warning=FALSE, results='asis'}
+gm <- ais_vs_net[id=="142911934",.(new_entid, paidincap, reg_cap_invested, year)]
+setkey(gm, year)
+gm_num_investor <- pan[new_entid_invested=="47142",
+    length(unique(new_entid_investor)),by=year]
+gm <- merge(gm, gm_num_investor, by="year")
+setnames(gm, "V1", "num_investor")
+print(xtable(gm), include.rownames=F)
+```
+
+### Foreign: Samsung 617882066
+
+```{r Samsung, echo=F, message=FALSE, warning=FALSE, results='asis'}
+gm <- ais_vs_net[id=="617882066",.(new_entid, paidincap, reg_cap_invested, year)]
+setkey(gm, year)
+gm_num_investor <- pan[new_entid_invested=="2847008",
+    length(unique(new_entid_investor)),by=year]
+gm <- merge(gm, gm_num_investor, by="year")
+setnames(gm, "V1", "num_investor")
+print(xtable(gm), include.rownames=F)
+```
+
+### Joint venture: Shanghai GM
+
+```{r shanghai gm, echo=F, message=FALSE, warning=FALSE, results='asis'}
+gm <- ais_vs_net[id=="607371748",.(new_entid, paidincap, reg_cap_invested, year)]
+setkey(gm, year)
+gm_num_investor <- pan[new_entid_invested=="72398" | new_entid_invested=="607371748",
+    length(unique(new_entid_investor)),by=year]
+gm <- merge(gm, gm_num_investor, by="year")
+setnames(gm, "V1", "num_investor")
+print(xtable(gm), include.rownames=F)
+```
+
