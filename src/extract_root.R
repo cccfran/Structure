@@ -13,6 +13,11 @@ edges <- as_data_frame(g, "edges")
 setDT(edges)
 edges[, weight:=weight/100]
 
+# listed firm's shareholders
+lf <- fread("../../data-listed firms/listed_firm_investee_investor_pair.csv")
+edges <- rbind(edges, lf[,.(from = org_encode_investor, to = org_encode, 
+                            weight = percent/100, cash = NA)])
+
 firms_raw <- fread("output/listed_firms_with_orgencode.csv")
 
 firms <- firms_raw[org_encode != "",.(corp_name, org_encode)]
@@ -63,7 +68,7 @@ for(i in seq_along(firms)) {
     
     # if no investor up one layer, then they are the ultimate owners
     ultimate <- rbind(ultimate,
-                      merge(es[, .(org_encode, investor, accu_weight = weight, step)], 
+                      merge(es[, .(org_encode, investor, accu_weight, step)], 
                             es_nxt_end, by="investor"))
     ultimate
   }
@@ -74,10 +79,26 @@ for(i in seq_along(firms)) {
 
 ret_ult_df <- rbindlist(ret_ult)
 ret_ult_df <- rbind(ret_ult_df, ret_sub[,.(investor, org_encode, accu_weight = 1, step)])
+ret_ult_df <- ret_ult_df[,.(org_encode, ultimate_owner = investor, accu_weight, step)]
+ret_ult_df <- ret_ult_df[order(step)]
+ret_ult_df <- ret_ult_df[ultimate_owner!=""]
+tmp <- unique(ret_ult_df[,.(org_encode, ultimate_owner, accu_weight, step)], 
+       by = c("org_encode", "ultimate_owner", "step"))
+
+# cumulative weight by layer
+tmp[, .(mean_weight = mean(accu_weight), 
+        median_weight = median(accu_weight), .N), by=.(step)]
+
+# layer of the max cumulative weight of each firm
+summary(tmp[tmp[,.I[which.max(accu_weight)], by=.(org_encode)]$V1]$step)
+
 
 fwrite(rbind(rbindlist(ret), ret_sub), "output/listed_firms_investor.csv")
-fwrite(ret_ult_df[,.(org_encode, ultimate_owner = investor, accu_weight, step)], "output/listed_firms_ultimate_owner.csv")
-
+fwrite(unique(ret_ult_df[,.(org_encode, ultimate_owner, accu_weight, step)], 
+              by = c("org_encode", "ultimate_owner", "step")), 
+       "../../data-listed firms/listed_firms_ultimate_owner_long.csv")
+fwrite(unique(ret_ult_df[,.(ultimate_owner)]), 
+       "../../data-listed firms/listed_firms_ultimate_owner.csv")
 
 
 # firms <- firms_raw[org_encode != "",.(corp_name, org_encode)]
